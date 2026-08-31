@@ -8,6 +8,7 @@ import {
   RecordingStatus,
 } from "@/contexts/RecordingStateContext";
 import { recordingService } from "@/services/recordingService";
+import { selectionValue } from "@/lib/audioDeviceModes";
 import { showRecordingNotification } from "@/lib/recordingNotification";
 import { prepareRecordingMetadata } from "@/lib/recordingCalendarLink";
 import { toast } from "sonner";
@@ -118,8 +119,8 @@ export function useRecordingStart(
       // Start the actual backend recording
       console.log("Starting backend recording with meeting:", meetingTitle);
       await recordingService.startRecordingWithDevices(
-        selectedDevices?.micDevice || null,
-        selectedDevices?.systemDevice || null,
+        selectionValue(selectedDevices?.micDevice),
+        selectionValue(selectedDevices?.systemDevice),
         meetingTitle,
       );
       console.log("Backend recording started successfully");
@@ -214,8 +215,8 @@ export function useRecordingStart(
               generatedMeetingTitle,
             );
             const result = await recordingService.startRecordingWithDevices(
-              selectedDevices?.micDevice || null,
-              selectedDevices?.systemDevice || null,
+              selectionValue(selectedDevices?.micDevice),
+              selectionValue(selectedDevices?.systemDevice),
               generatedMeetingTitle,
             );
             console.log("Auto-start backend recording result:", result);
@@ -316,8 +317,8 @@ export function useRecordingStart(
           generatedMeetingTitle,
         );
         const result = await recordingService.startRecordingWithDevices(
-          selectedDevices?.micDevice || null,
-          selectedDevices?.systemDevice || null,
+          selectionValue(selectedDevices?.micDevice),
+          selectionValue(selectedDevices?.systemDevice),
           generatedMeetingTitle,
         );
         console.log("Backend recording result:", result);

@@ -19,6 +19,12 @@ export interface RecordingPreferences {
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
   show_recording_notification: boolean;
+  /**
+   * Let the system-audio side capture a single application instead of
+   * everything the speakers play. Experimental — see
+   * `audio::app_audio` on the Rust side.
+   */
+  app_audio_capture: boolean;
 }
 
 interface RecordingSettingsProps {
@@ -33,6 +39,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     preferred_mic_device: null,
     preferred_system_device: null,
     show_recording_notification: true,
+    app_audio_capture: false,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -103,6 +110,27 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       toast.success("Preference saved");
     } catch (error) {
       console.error("Failed to save notification preference:", error);
+      toast.error("Failed to save preference");
+    }
+  };
+
+  const handleAppAudioToggle = async (enabled: boolean) => {
+    const newPreferences = { ...preferences, app_audio_capture: enabled };
+    // Turning it off leaves any `app:` selection stored but no longer
+    // honoured; the Rust side falls back to the default system audio, so
+    // switching back on restores the choice rather than losing it.
+    setPreferences(newPreferences);
+    try {
+      await invoke("set_recording_preferences", {
+        preferences: newPreferences,
+      });
+      toast.success(
+        enabled
+          ? "Per-app system audio is on"
+          : "Per-app system audio is off — recording the default output",
+      );
+    } catch (error) {
+      console.error("Failed to save the per-app capture preference:", error);
       toast.error("Failed to save preference");
     }
   };
@@ -202,6 +230,22 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           <Switch
             checked={preferences.show_recording_notification}
             onCheckedChange={handleNotificationToggle}
+          />
+        </SettingsRow>
+      </SettingsCard>
+
+      <SettingsCard
+        title="Record a single application"
+        description="Experimental. Adds your running apps to the system audio picker, so a recording can capture just the call and not the video playing in another window. Turn it off to put every selection back on the ordinary system audio capture."
+      >
+        <SettingsRow
+          label="Per-app system audio"
+          description="Taps the chosen app's own audio instead of the whole output mix"
+        >
+          <Switch
+            checked={preferences.app_audio_capture}
+            onCheckedChange={handleAppAudioToggle}
+            disabled={saving}
           />
         </SettingsRow>
       </SettingsCard>

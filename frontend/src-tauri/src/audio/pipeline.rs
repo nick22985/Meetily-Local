@@ -7,6 +7,7 @@ use rubato::{
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -17,6 +18,14 @@ use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, DeviceType, RecordingState};
 use super::vad::ContinuousVadProcessor;
 
+/// How long a source may go without delivering before the mixer stops
+/// waiting on it.
+///
+/// Long enough to cover normal scheduling jitter on either capture
+/// thread, short enough that a suspended sink monitor or a mic that has
+/// gone away doesn't stall the other channel for an audible stretch.
+const SOURCE_STALL_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
 struct AudioMixerRingBuffer {
@@ -24,6 +33,11 @@ struct AudioMixerRingBuffer {
     system_buffer: VecDeque<f32>,
     window_size_samples: usize, // Fixed mixing window (e.g., 50ms)
     max_buffer_size: usize,     // Safety limit (e.g., 100ms)
+    /// When each source last delivered samples; `None` until it first
+    /// does. A source that is delivering has to be waited for — see
+    /// [`AudioMixerRingBuffer::can_mix`].
+    mic_last_seen: Option<Instant>,
+    system_last_seen: Option<Instant>,
 }
 
 impl AudioMixerRingBuffer {
@@ -51,6 +65,8 @@ impl AudioMixerRingBuffer {
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            mic_last_seen: None,
+            system_last_seen: None,
         }
     }
 
@@ -66,6 +82,13 @@ impl AudioMixerRingBuffer {
                     self.system_buffer.len(),
                     self.max_buffer_size
                 );
+            }
+        }
+
+        if !samples.is_empty() {
+            match device_type {
+                DeviceType::Microphone => self.mic_last_seen = Some(Instant::now()),
+                DeviceType::System => self.system_last_seen = Some(Instant::now()),
             }
         }
 
@@ -99,9 +122,46 @@ impl AudioMixerRingBuffer {
         }
     }
 
+    /// Whether a source is still delivering, and so has to be waited for.
+    ///
+    /// A source that has never delivered isn't live either — at startup
+    /// the two streams open a moment apart, and the first one shouldn't
+    /// sit blocked waiting for a second that may never arrive (system
+    /// audio is allowed to fail without failing the recording).
+    fn is_live(last_seen: Option<Instant>) -> bool {
+        last_seen.is_some_and(|at| at.elapsed() < SOURCE_STALL_TIMEOUT)
+    }
+
+    /// Whether a full window can be taken from every source that is
+    /// still delivering.
+    ///
+    /// This has to be an AND across live sources, not an OR. The mic and
+    /// the sink monitor are independent PipeWire streams on their own
+    /// threads, so one is always a chunk or so ahead of the other; with
+    /// an OR, every window the leader completed also drained the
+    /// laggard's partial buffer and zero-padded it to width. That spliced
+    /// a few milliseconds of silence into one channel twenty times a
+    /// second — a steady crackle, and the reason this waits instead.
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples
-            || self.system_buffer.len() >= self.window_size_samples
+        let mic_live = Self::is_live(self.mic_last_seen);
+        let system_live = Self::is_live(self.system_last_seen);
+
+        let mic_full = self.mic_buffer.len() >= self.window_size_samples;
+        let system_full = self.system_buffer.len() >= self.window_size_samples;
+
+        // Nothing is delivering: drain whatever whole windows are left
+        // over rather than stranding them in the buffer.
+        if !mic_live && !system_live {
+            return mic_full || system_full;
+        }
+
+        // A stalled source is not waited on; it contributes silence.
+        let mic_ready = !mic_live || mic_full;
+        let system_ready = !system_live || system_full;
+
+        // At least one real window, so a lone stalled source can't spin
+        // this loop emitting silence.
+        mic_ready && system_ready && (mic_full || system_full)
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -109,52 +169,28 @@ impl AudioMixerRingBuffer {
             return None;
         }
 
-        // Extract mic window with zero-padding for incomplete buffers
-        // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
-
-        // Extract mic window (or pad with zeros if insufficient data)
-        let mic_window = if self.mic_buffer.len() >= self.window_size_samples {
-            // Enough mic data - drain window
-            self.mic_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.mic_buffer.is_empty() {
-            // Some mic data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.mic_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No mic data - return silence
-            vec![0.0; self.window_size_samples]
-        };
-
-        // Extract system window (or pad with zeros if insufficient data)
-        let sys_window = if self.system_buffer.len() >= self.window_size_samples {
-            // Enough system data - drain window
-            self.system_buffer
-                .drain(0..self.window_size_samples)
-                .collect()
-        } else if !self.system_buffer.is_empty() {
-            // Some system data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.system_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No system data - return silence
-            vec![0.0; self.window_size_samples]
-        };
+        let window = self.window_size_samples;
+        let mic_window = Self::take_window(&mut self.mic_buffer, window);
+        let sys_window = Self::take_window(&mut self.system_buffer, window);
 
         Some((mic_window, sys_window))
+    }
+
+    /// Take one window from a source, padding with silence only for what
+    /// isn't there.
+    ///
+    /// Padding is reached only for a source [`can_mix`](Self::can_mix)
+    /// has decided isn't delivering — a stall, or a stream that never
+    /// started. Zero-padding is preferred over last-sample-hold, which
+    /// would repeat audible content.
+    fn take_window(buffer: &mut VecDeque<f32>, window: usize) -> Vec<f32> {
+        if buffer.len() >= window {
+            return buffer.drain(0..window).collect();
+        }
+
+        let mut padded: Vec<f32> = buffer.drain(..).collect();
+        padded.resize(window, 0.0);
+        padded
     }
 }
 
@@ -671,13 +707,73 @@ pub struct AudioPipeline {
     // the speakers, using the aligned system window as the far-end reference.
     // `None` when AEC couldn't initialize — recording continues without it.
     echo_canceller: Option<super::aec::MicEchoCanceller>,
-    // Sender for the interleaved stereo recording chunks (mic L, system R).
+    // Sender for the mono recording chunks (mic + system, mixed down).
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
     // Streaming partials: snapshots of in-progress utterances sent to the
     // partial-decode task. None when streaming partials are disabled.
     partial_sender: Option<mpsc::UnboundedSender<super::recording_state::PartialAudioChunk>>,
     mic_partial: PartialEmitState,
     system_partial: PartialEmitState,
+    // Catches a capture stream that runs but delivers nothing, which is how
+    // a wrong-node system capture presents itself.
+    mic_silence: SilenceWatch,
+    system_silence: SilenceWatch,
+}
+
+/// How long one capture channel may stay at digital silence before we say so.
+///
+/// A capture stream pointed at the wrong node fails quietly: it negotiates,
+/// runs, and delivers an unbroken run of zeros, so the recording looks fine
+/// until someone plays it back and finds a dead channel. That is the exact
+/// shape of "Discord was on a different sink than the one we monitored".
+/// A minute of unbroken silence is long enough that no real meeting trips it
+/// by accident, and the warning fires once per source per recording.
+const SILENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Anything at or below this is treated as digital silence rather than a
+/// quiet room — a live monitor of an idle sink emits exact zeros, and so
+/// does a stream reading from nothing.
+const SILENCE_FLOOR: f32 = 1e-6;
+
+/// Watches one capture channel for a sustained run of pure silence.
+struct SilenceWatch {
+    label: &'static str,
+    /// When the current run of silence began.
+    silent_since: Instant,
+    /// Set once the warning has fired, cleared as soon as sound returns, so
+    /// a channel that recovers can warn again if it dies later.
+    warned: bool,
+}
+
+impl SilenceWatch {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            silent_since: Instant::now(),
+            warned: false,
+        }
+    }
+
+    /// Feed one window; warns the first time the run passes the timeout.
+    fn observe(&mut self, window: &[f32]) {
+        if window.iter().any(|s| s.abs() > SILENCE_FLOOR) {
+            self.silent_since = Instant::now();
+            self.warned = false;
+            return;
+        }
+        if self.warned || self.silent_since.elapsed() < SILENT_CHANNEL_TIMEOUT {
+            return;
+        }
+        self.warned = true;
+        warn!(
+            "🔇 {} has been completely silent for {}s of recording. The stream is \
+             running but carrying nothing — check the '🎵 Stream: opening PipeWire capture' \
+             line above for the node it landed on, and whether that is where the audio \
+             is actually going.",
+            self.label,
+            SILENT_CHANNEL_TIMEOUT.as_secs()
+        );
+    }
 }
 
 /// Per-source bookkeeping that throttles streaming-partial emission.
@@ -704,22 +800,22 @@ impl AudioPipeline {
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
-        mic_device_name: String,
+        mic_device_name: Option<String>,
         mic_device_kind: super::device_detection::InputDeviceKind,
-        system_device_name: String,
+        system_device_name: Option<String>,
         system_device_kind: super::device_detection::InputDeviceKind,
     ) -> Self {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!(
             "   Mic: '{}' ({:?}) - Buffer: {:?}",
-            mic_device_name,
+            mic_device_name.as_deref().unwrap_or("not captured"),
             mic_device_kind,
             mic_device_kind.buffer_timeout()
         );
         info!(
             "   System: '{}' ({:?}) - Buffer: {:?}",
-            system_device_name,
+            system_device_name.as_deref().unwrap_or("not captured"),
             system_device_kind,
             system_device_kind.buffer_timeout()
         );
@@ -805,6 +901,8 @@ impl AudioPipeline {
             partial_sender: None,             // Will be set by manager if enabled
             mic_partial: PartialEmitState::default(),
             system_partial: PartialEmitState::default(),
+            mic_silence: SilenceWatch::new("The microphone channel"),
+            system_silence: SilenceWatch::new("The system-audio channel"),
         }
     }
 
@@ -899,28 +997,44 @@ impl AudioPipeline {
                             self.run_vad_for_source(&mic_window, DeviceType::Microphone);
                             self.run_vad_for_source(&sys_window, DeviceType::System);
 
-                            // STEP 4: Interleave the two sources into a stereo
-                            // frame for the recording — mic = left, system =
-                            // right — so playback and downstream processing can
-                            // keep them apart (source-aware per-segment
-                            // playback, echo cancellation, …). The mono downmix
-                            // is derived on demand (the decoder averages
-                            // channels) rather than stored.
+                            // Watch for a channel that is running but dead. The
+                            // mic is checked post-AEC, which is what lands in the
+                            // recording, so a mic drowned out by cancellation
+                            // counts as silent too.
+                            self.mic_silence.observe(&mic_window);
+                            self.system_silence.observe(&sys_window);
+
+                            // STEP 4: Mix the two sources down to one mono
+                            // channel for the recording. An earlier layout put
+                            // mic on the left and system on the right to keep
+                            // them separable, but that is a recording nobody
+                            // can listen to: every voice sits hard against one
+                            // ear, and a side that isn't captured leaves that
+                            // ear silent for the whole meeting.
+                            //
+                            // Summing is right rather than averaging — the two
+                            // sources are different people, not two takes of
+                            // the same one, so halving each to make room would
+                            // just make the whole meeting quiet. They rarely
+                            // peak together (the mic is AEC-cleaned of the
+                            // system audio, and people take turns), and the
+                            // clamp catches the times they do.
                             let frames = mic_window.len().max(sys_window.len());
-                            let mut stereo = Vec::with_capacity(frames * 2);
+                            let mut mono = Vec::with_capacity(frames);
                             for i in 0..frames {
-                                stereo.push(mic_window.get(i).copied().unwrap_or(0.0)); // L: mic
-                                stereo.push(sys_window.get(i).copied().unwrap_or(0.0)); // R: system
+                                let mic = mic_window.get(i).copied().unwrap_or(0.0);
+                                let sys = sys_window.get(i).copied().unwrap_or(0.0);
+                                mono.push((mic + sys).clamp(-1.0, 1.0));
                             }
 
                             if let Some(ref sender) = self.recording_sender_for_mixed {
                                 let recording_chunk = AudioChunk {
-                                    data: stereo,
+                                    data: mono,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
                                     // device_type is unused by the saver for the
-                                    // stereo recording chunk; left as Microphone.
+                                    // mixed recording chunk; left as Microphone.
                                     device_type: DeviceType::Microphone,
                                 };
                                 let _ = sender.send(recording_chunk);
@@ -1117,20 +1231,22 @@ impl AudioPipelineManager {
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         partial_sender: Option<mpsc::UnboundedSender<super::recording_state::PartialAudioChunk>>,
-        mic_device_name: String,
+        mic_device_name: Option<String>,
         mic_device_kind: super::device_detection::InputDeviceKind,
-        system_device_name: String,
+        system_device_name: Option<String>,
         system_device_kind: super::device_detection::InputDeviceKind,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
         info!(
             "   Microphone: '{}' ({:?})",
-            mic_device_name, mic_device_kind
+            mic_device_name.as_deref().unwrap_or("not captured"),
+            mic_device_kind
         );
         info!(
             "   System Audio: '{}' ({:?})",
-            system_device_name, system_device_kind
+            system_device_name.as_deref().unwrap_or("not captured"),
+            system_device_kind
         );
 
         // Create audio processing channel

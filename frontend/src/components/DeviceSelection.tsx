@@ -12,6 +12,16 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Heading } from "@/components/ui/typography";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  MIC_MODE_OPTIONS,
+  SYSTEM_MODE_OPTIONS,
+  appKey,
+  appOptions,
+  selectionValue,
+  storedSelection,
+} from "@/lib/audioDeviceModes";
+import { useResolvedRoute } from "@/hooks/useResolvedRoute";
+import { useAppAudioSources } from "@/hooks/useAppAudioSources";
 
 /**
  * A capture device as reported by the PipeWire registry.
@@ -25,7 +35,11 @@ export interface AudioDevice {
 }
 
 export interface SelectedDevices {
-  /** PipeWire node id, or null = system default. */
+  /**
+   * PipeWire node id, `null` = system default, or the
+   * `"communication"` sentinel = follow the active call. See
+   * `@/lib/audioDeviceModes`.
+   */
   micDevice: string | null;
   systemDevice: string | null;
 }
@@ -48,6 +62,12 @@ export function DeviceSelection({
 
   const microphones = devices.filter((d) => d.kind === "microphone");
   const systemDevices = devices.filter((d) => d.kind === "system");
+
+  const route = useResolvedRoute(
+    selectedDevices.micDevice,
+    selectedDevices.systemDevice,
+  );
+  const apps = useAppAudioSources();
 
   // Fetch available audio devices
   const fetchDevices = useCallback(async () => {
@@ -76,22 +96,38 @@ export function DeviceSelection({
 
   const handleRefresh = async () => {
     setRefreshing(true);
+    apps.refresh();
     await fetchDevices();
   };
 
   const handleMicDeviceChange = (deviceId: string) => {
     onDeviceChange({
       ...selectedDevices,
-      micDevice: deviceId === "default" ? null : deviceId,
+      micDevice: storedSelection(deviceId),
     });
   };
 
   const handleSystemDeviceChange = (deviceId: string) => {
     onDeviceChange({
       ...selectedDevices,
-      systemDevice: deviceId === "default" ? null : deviceId,
+      systemDevice: storedSelection(deviceId),
     });
   };
+
+  /** The label for a node id, once the graph has told us which one. */
+  const resolvedLabel = (nodeId: string | null) => {
+    if (!nodeId) return null;
+    // An app selection resolves to itself, not to a node: the capture
+    // follows the app around the graph, so there is no device to name.
+    const key = appKey(nodeId);
+    if (key) {
+      return apps.sources.find((s) => s.key === key)?.label ?? key;
+    }
+    return devices.find((d) => d.id === nodeId)?.label ?? nodeId;
+  };
+
+  const micRouteLabel = resolvedLabel(route.microphone);
+  const systemRouteLabel = resolvedLabel(route.system);
 
   if (loading) {
     return (
@@ -144,7 +180,7 @@ export function DeviceSelection({
             </Label>
           </div>
           <Select
-            value={selectedDevices.micDevice || "default"}
+            value={selectionValue(selectedDevices.micDevice)}
             onValueChange={handleMicDeviceChange}
             disabled={disabled}
           >
@@ -152,7 +188,11 @@ export function DeviceSelection({
               <SelectValue placeholder="Select Microphone" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="default">Default Microphone</SelectItem>
+              {MIC_MODE_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
               {microphones.map((device) => (
                 <SelectItem key={device.id} value={device.id}>
                   {device.label}
@@ -160,6 +200,11 @@ export function DeviceSelection({
               ))}
             </SelectContent>
           </Select>
+          {micRouteLabel && (
+            <p className="text-sm text-muted-foreground">
+              Currently using {micRouteLabel}
+            </p>
+          )}
           {microphones.length === 0 && (
             <p className="text-sm text-muted-foreground">
               No microphone devices found
@@ -180,7 +225,7 @@ export function DeviceSelection({
           </div>
 
           <Select
-            value={selectedDevices.systemDevice || "default"}
+            value={selectionValue(selectedDevices.systemDevice)}
             onValueChange={handleSystemDeviceChange}
             disabled={disabled}
           >
@@ -188,15 +233,29 @@ export function DeviceSelection({
               <SelectValue placeholder="Select System Audio" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="default">Default System Audio</SelectItem>
+              {SYSTEM_MODE_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
               {systemDevices.map((device) => (
                 <SelectItem key={device.id} value={device.id}>
                   {device.label}
                 </SelectItem>
               ))}
+              {appOptions(apps.sources).map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
 
+          {systemRouteLabel && (
+            <p className="text-sm text-muted-foreground">
+              Currently using {systemRouteLabel}
+            </p>
+          )}
           {systemDevices.length === 0 && (
             <p className="text-sm text-muted-foreground">
               No system audio devices found
@@ -214,6 +273,24 @@ export function DeviceSelection({
           • <strong>System Audio:</strong> Records computer audio (music, calls,
           etc.) from the selected output device
         </p>
+        <p>
+          • <strong>Follow the active call:</strong> Tracks whichever device
+          your call app is using, and switches with it mid-recording
+        </p>
+        {apps.enabled && (
+          <>
+            <p>
+              • <strong>Whichever app is in a call:</strong> Records only the
+              app you are actually in a call with — Discord, a Meet tab, Zoom —
+              and picks it up when the call starts
+            </p>
+            <p>
+              • <strong>A named application:</strong> Records only what that app
+              plays, leaving everything else your speakers are doing out of the
+              recording
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

@@ -8,6 +8,16 @@ import type {
   AudioDevice,
   SelectedDevices,
 } from "@/components/DeviceSelection";
+import {
+  MIC_MODE_OPTIONS,
+  SYSTEM_MODE_OPTIONS,
+  appKey,
+  appOptions,
+  selectionValue,
+  storedSelection,
+} from "@/lib/audioDeviceModes";
+import { useResolvedRoute } from "@/hooks/useResolvedRoute";
+import { useAppAudioSources } from "@/hooks/useAppAudioSources";
 import { DeviceChip } from "./DeviceChip";
 
 const LANGUAGE_OPTIONS = [
@@ -72,27 +82,58 @@ export function DeviceSummary({ disabled = false }: DeviceSummaryProps) {
   const inputs = devices.filter((d) => d.kind === "microphone");
   const outputs = devices.filter((d) => d.kind === "system");
 
-  // "default" is the canonical sentinel — same value DeviceSelection
-  // uses on the Settings page. Storing `null` in the context means
-  // "use the system default device" (the backend treats null this way).
+  // Selections use the sentinels from `@/lib/audioDeviceModes` — the
+  // same values DeviceSelection uses on the Settings page. Storing
+  // `null` in the context means "system default" (the backend treats
+  // null this way), so it collapses onto that sentinel.
   const setMic = (id: string) =>
     setSelectedDevices({
       ...selectedDevices,
-      micDevice: id === "default" ? null : id,
+      micDevice: storedSelection(id),
     } as SelectedDevices);
   const setSystem = (id: string) =>
     setSelectedDevices({
       ...selectedDevices,
-      systemDevice: id === "default" ? null : id,
+      systemDevice: storedSelection(id),
     } as SelectedDevices);
 
+  const route = useResolvedRoute(
+    selectedDevices?.micDevice,
+    selectedDevices?.systemDevice,
+  );
+  const apps = useAppAudioSources();
+
   // Selections are stored as PipeWire node ids; show the human label.
-  const labelFor = (id: string | null | undefined, fallback: string) =>
-    id ? (devices.find((d) => d.id === id)?.label ?? id) : fallback;
-  const micLabel = labelFor(selectedDevices?.micDevice, "Default microphone");
+  // For a selection that follows the graph, the chip shows where it
+  // currently lands rather than the mode name — that is the thing the
+  // user actually wants to check before hitting record.
+  const nodeLabel = (id: string) =>
+    devices.find((d) => d.id === id)?.label ?? id;
+  const labelFor = (
+    id: string | null | undefined,
+    resolved: string | null,
+    options: { value: string; label: string }[],
+  ) => {
+    const value = selectionValue(id);
+    // An app selection names the app, not wherever it happens to be
+    // playing — that is the whole point of picking one.
+    const app = appKey(value);
+    if (app) {
+      return apps.sources.find((s) => s.key === app)?.label ?? app;
+    }
+    const mode = options.find((o) => o.value === value);
+    if (!mode) return nodeLabel(value);
+    return resolved ? `${mode.label} · ${nodeLabel(resolved)}` : mode.label;
+  };
+  const micLabel = labelFor(
+    selectedDevices?.micDevice,
+    route.microphone,
+    MIC_MODE_OPTIONS,
+  );
   const systemLabel = labelFor(
     selectedDevices?.systemDevice,
-    "Default system audio",
+    route.system,
+    SYSTEM_MODE_OPTIONS,
   );
   const languageLabel =
     LANGUAGE_OPTIONS.find((l) => l.value === selectedLanguage)?.label ??
@@ -104,10 +145,10 @@ export function DeviceSummary({ disabled = false }: DeviceSummaryProps) {
         icon={<Mic className="size-3.5" />}
         value={micLabel}
         options={[
-          { value: "default", label: "Default microphone" },
+          ...MIC_MODE_OPTIONS,
           ...inputs.map((d) => ({ value: d.id, label: d.label })),
         ]}
-        selectedValue={selectedDevices?.micDevice ?? "default"}
+        selectedValue={selectionValue(selectedDevices?.micDevice)}
         onSelect={setMic}
         emptyState="No microphones detected"
         disabled={disabled}
@@ -116,10 +157,11 @@ export function DeviceSummary({ disabled = false }: DeviceSummaryProps) {
         icon={<Speaker className="size-3.5" />}
         value={systemLabel}
         options={[
-          { value: "default", label: "Default system audio" },
+          ...SYSTEM_MODE_OPTIONS,
           ...outputs.map((d) => ({ value: d.id, label: d.label })),
+          ...appOptions(apps.sources),
         ]}
-        selectedValue={selectedDevices?.systemDevice ?? "default"}
+        selectedValue={selectionValue(selectedDevices?.systemDevice)}
         onSelect={setSystem}
         emptyState="No output devices detected"
         disabled={disabled}

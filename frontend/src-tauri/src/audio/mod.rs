@@ -15,8 +15,16 @@ pub mod devices;
 #[cfg(target_os = "linux")]
 pub mod pw;
 
+// Capturing one application's playback instead of the whole sink mix
+pub mod app_audio;
+
 // Device classification for adaptive buffering (Bluetooth vs wired)
 pub mod device_detection;
+
+// How a device selection (a node name, or a "default"/"communication"
+// sentinel) resolves to the node we actually capture from
+pub mod device_follower;
+pub mod device_mode;
 pub mod ffmpeg_mixer;
 
 // Recording system
@@ -64,6 +72,8 @@ pub use recording_saver::RecordingSaver;
 pub use recording_state::{
     AudioChunk, AudioError, DeviceType as RecordingDeviceType, ProcessedAudioChunk, RecordingState,
 };
+pub use app_audio::{list_app_audio_sources, AppAudioCatalog, AppAudioSource};
+pub use device_mode::{DeviceMode, DEVICE_COMMUNICATION, DEVICE_SYSTEM_DEFAULT};
 pub use stream::AudioStreamManager;
 
 pub use device_detection::{calculate_buffer_timeout, InputDeviceKind};

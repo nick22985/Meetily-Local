@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/select";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Heading } from "@/components/ui/typography";
+import type { TranscriptModelProps } from "./TranscriptSettings";
 
 export interface Language {
   code: string;
@@ -127,12 +128,8 @@ interface LanguageSelectionProps {
   selectedLanguage: string;
   onLanguageChange: (language: string) => void;
   disabled?: boolean;
-  provider?:
-    | "localWhisper"
-    | "deepgram"
-    | "elevenLabs"
-    | "groq"
-    | "openai";
+  /** Reuses the transcript config's union so the two can't drift apart. */
+  provider?: TranscriptModelProps["provider"];
 }
 
 export function LanguageSelection({

@@ -53,8 +53,16 @@ export function RecordingTopBar({
   const recordingState = useRecordingState();
   const isPaused = recordingState.isPaused;
 
+  // Mount time is only the fallback. The backend tracks the real elapsed
+  // time, which matters because this bar remounts whenever the user leaves
+  // the recording page and comes back — a purely local timer would restart
+  // at zero mid-recording.
   const [startedAt] = useState(() => Date.now());
   const [now, setNow] = useState(() => Date.now());
+  const elapsedMs =
+    recordingState.recordingDuration !== null
+      ? recordingState.recordingDuration * 1000
+      : now - startedAt;
   const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
 
@@ -144,7 +152,7 @@ export function RecordingTopBar({
           {isPaused ? "Paused" : "Recording"}
         </span>
         <span className="font-mono text-sm tabular-nums text-muted-foreground">
-          {formatElapsed(now - startedAt)}
+          {formatElapsed(elapsedMs)}
         </span>
       </div>
 

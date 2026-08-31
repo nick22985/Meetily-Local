@@ -79,3 +79,4 @@ target/
 
 frontend/src-tauri/binaries/
 Cargo.lock
+.pnpm-store/

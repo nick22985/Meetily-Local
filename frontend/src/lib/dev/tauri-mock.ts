@@ -127,6 +127,8 @@ const COMMAND_DEFAULTS: Record<string, Default> = {
 
   // --- Audio devices / levels ----------------------------------------------
   get_audio_devices: () => [], // flat Device[] — consumers call .filter()
+  // Read unguarded as `.sources` by the app-audio picker.
+  list_app_audio_sources: () => ({ enabled: false, sources: [] }),
   start_audio_level_monitoring: null,
   stop_audio_level_monitoring: null,
 
@@ -144,6 +146,7 @@ const COMMAND_DEFAULTS: Record<string, Default> = {
     preferred_mic_device: null,
     preferred_system_device: null,
     show_recording_notification: true,
+    app_audio_capture: false,
   }),
   api_get_model_config: null,
   api_get_api_key: null,

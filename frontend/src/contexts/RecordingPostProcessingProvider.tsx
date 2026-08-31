@@ -1,8 +1,13 @@
 "use client";
 
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useRecordingStop } from "@/hooks/useRecordingStop";
+
+// The global RecordingStateContext already owns the recording flags; the
+// hook only takes these for the recording page's local mirrors. Declared at
+// module scope so the hook's dependencies stay stable across renders.
+const noop = () => {};
 
 /**
  * RecordingPostProcessingProvider
@@ -22,18 +27,23 @@ export function RecordingPostProcessingProvider({
 }: {
   children: React.ReactNode;
 }) {
-  // No-op functions since the global RecordingStateContext already handles state updates
-  // These are only needed for the hook's local component state management
-  const setIsRecording = () => {};
-  const setIsRecordingDisabled = () => {};
+  const { handleRecordingStop } = useRecordingStop(noop, noop);
 
-  const { handleRecordingStop } = useRecordingStop(
-    setIsRecording,
-    setIsRecordingDisabled,
-  );
+  // `handleRecordingStop` gets a new identity on every render, and this
+  // provider re-renders roughly twice a second while a recording is running
+  // (RecordingStateContext polls the backend at 500ms). Keying the effect on
+  // it would tear the listener down and re-register it that often, and
+  // `listen()` is async — a stop landing in the gap is dropped outright,
+  // leaving the recording unsaved and the UI stuck in STOPPING. Register
+  // once and reach the current handler through a ref instead.
+  const handleRecordingStopRef = useRef(handleRecordingStop);
+  useEffect(() => {
+    handleRecordingStopRef.current = handleRecordingStop;
+  });
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
+    let cancelled = false;
 
     const setupListener = async () => {
       try {
@@ -48,9 +58,16 @@ export function RecordingPostProcessingProvider({
 
             // Call the post-processing handler
             // event.payload is the callApi boolean (true for normal stops)
-            handleRecordingStop(event.payload);
+            handleRecordingStopRef.current(event.payload);
           },
         );
+
+        // Unmounted while `listen` was still resolving.
+        if (cancelled) {
+          unlistenFn();
+          unlistenFn = undefined;
+          return;
+        }
 
         console.log(
           "[RecordingPostProcessing] Event listener set up successfully",
@@ -66,12 +83,13 @@ export function RecordingPostProcessingProvider({
     setupListener();
 
     return () => {
+      cancelled = true;
       if (unlistenFn) {
         console.log("[RecordingPostProcessing] Cleaning up event listener");
         unlistenFn();
       }
     };
-  }, [handleRecordingStop]);
+  }, []);
 
   return <>{children}</>;
 }

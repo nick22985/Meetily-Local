@@ -52,9 +52,15 @@ class RecordingService {
   }
 
   /**
-   * Start recording with device configuration and meeting name
-   * @param micDeviceName - Microphone device name (null for default)
-   * @param systemDeviceName - System audio device name (null for none)
+   * Start recording with device configuration and meeting name.
+   *
+   * `null` means "record nothing on that side", not "use the default" —
+   * the stored form of the default selection is `null`, so pass it
+   * through `selectionValue()` (`@/lib/audioDeviceModes`) first or the
+   * side is silently dropped from the recording.
+   *
+   * @param micDeviceName - Microphone selection, or null for no microphone
+   * @param systemDeviceName - System audio selection, or null for no system audio
    * @param meetingName - Meeting name/title
    * @returns Promise<void>
    */

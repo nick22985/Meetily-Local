@@ -89,14 +89,10 @@ async fn decode_and_emit<R: Runtime>(
     source: DeviceType,
     chunk: PartialAudioChunk,
 ) -> Result<(), String> {
-    // Grab the shared whisper engine (same instance the final worker uses).
-    let engine = {
-        let guard = crate::whisper_engine::commands::WHISPER_ENGINE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-    let Some(engine) = engine else {
+    // Use whichever backend the final worker is on (local whisper-rs or a
+    // remote endpoint) — previews must not silently come from a different
+    // model than the committed transcript.
+    let Some(engine) = super::engine::current_transcription_engine() else {
         return Err("engine not loaded".into());
     };
     if !engine.is_model_loaded().await {

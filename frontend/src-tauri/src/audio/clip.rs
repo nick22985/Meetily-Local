@@ -64,10 +64,12 @@ pub(crate) async fn extract_clip_wav(
     let audio_path_str = audio_path.to_string_lossy().into_owned();
     let tmp_path_str = tmp_path.to_string_lossy().into_owned();
 
-    // Recordings are stereo (mic = left, system = right). Pick the channel that
-    // matches the segment's source so a remote speaker plays back from the
-    // clean system channel and the local user from the mic — no mic bleed and
-    // no cross-talk. Unknown source (or a legacy mono file) downmixes instead.
+    // Recordings are mono, so the clip is simply that stretch of the mix.
+    // Recordings made before the mixdown are stereo (mic = left, system =
+    // right), and for those the segment's own source picks the channel it was
+    // captured on — the local user from the mic, a remote speaker from the
+    // clean system side. Asking a mono file for a channel it doesn't have
+    // fails harmlessly and falls back to the downmix below.
     let channel: Option<u8> = match source {
         Some("mic") => Some(0),
         Some("system") => Some(1),
@@ -107,7 +109,7 @@ pub(crate) async fn extract_clip_wav(
         };
 
         // Try the requested source channel; fall back to a mono downmix if it
-        // fails — e.g. a legacy mono recording that has no right channel.
+        // fails, which is the normal path for a mono recording.
         let ok = run(channel).map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
         if !ok {
             let fell_back = channel.is_some()

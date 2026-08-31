@@ -19,6 +19,8 @@ pub const KEY_NOTIFICATION_SETTINGS: &str = "notification_settings";
 /// Frontend UI config (language, confidence indicator, auto-summary, provider model cache, ...).
 /// Shape is owned by the frontend; the backend stores it as an opaque JSON blob.
 pub const KEY_UI_CONFIG: &str = "ui_config";
+/// Automatic meeting detection settings (see `meeting_detector::settings::MeetingDetectionSettings`).
+pub const KEY_MEETING_DETECTION: &str = "meeting_detection_settings";
 
 #[derive(serde::Deserialize, Debug)]
 pub struct SaveModelConfigRequest {
@@ -194,6 +196,13 @@ impl SettingsRepository {
         provider: &str,
         api_key: &str,
     ) -> std::result::Result<(), sqlx::Error> {
+        // The remote-Whisper backend stores its key inside its own
+        // `app_settings` JSON blob (next to the endpoint URL, which has no
+        // column here either) — see `RemoteWhisperConfig`.
+        if provider == crate::audio::transcription::REMOTE_WHISPER_PROVIDER {
+            return Ok(());
+        }
+
         let api_key_column = match provider {
             "localWhisper" => "whisperApiKey",
             "deepgram" => "deepgramApiKey",
@@ -229,6 +238,14 @@ impl SettingsRepository {
         pool: &SqlitePool,
         provider: &str,
     ) -> std::result::Result<Option<String>, sqlx::Error> {
+        // See `save_transcript_api_key`: the remote backend's key isn't a
+        // column. Returning None here (rather than erroring on an unknown
+        // provider) keeps `api_get_transcript_config` working when the
+        // remote backend is the selected one.
+        if provider == crate::audio::transcription::REMOTE_WHISPER_PROVIDER {
+            return Ok(None);
+        }
+
         let api_key_column = match provider {
             "localWhisper" => "whisperApiKey",
             "deepgram" => "deepgramApiKey",

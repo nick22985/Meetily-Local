@@ -8,6 +8,7 @@ import {
   FlaskConical,
   Mic,
   Plug,
+  Radar,
   Settings2,
   SparkleIcon,
   Users,
@@ -16,6 +17,7 @@ import { useRouter } from "next/navigation";
 
 import { TranscriptSettings } from "@/components/TranscriptSettings";
 import { RecordingSettings } from "@/components/RecordingSettings";
+import { MeetingDetectionSettings } from "@/components/MeetingDetectionSettings";
 import { PreferenceSettings } from "@/components/PreferenceSettings";
 import { SummaryModelSettings } from "@/components/SummaryModelSettings";
 import { BetaSettings } from "@/components/BetaSettings";
@@ -42,6 +44,12 @@ const CATEGORIES: readonly SettingsCategory[] = [
     label: "Recordings",
     description: "Audio devices, capture format, and per-recording defaults.",
     icon: Mic,
+  },
+  {
+    id: "autodetect",
+    label: "Auto-detect",
+    description: "Notice when a call starts and record it without being asked.",
+    icon: Radar,
   },
   {
     id: "speakers",
@@ -149,6 +157,7 @@ export default function SettingsPage() {
             >
               {active.id === "general" && <PreferenceSettings />}
               {active.id === "recording" && <RecordingSettings />}
+              {active.id === "autodetect" && <MeetingDetectionSettings />}
               {active.id === "speakers" && <SpeakerSettings />}
               {active.id === "transcription" && (
                 <TranscriptSettings

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 
 use crate::{
+    audio::transcription::{RemoteModelCatalog, RemoteWhisperClient, RemoteWhisperConfig},
     database::{
         models::MeetingModel,
         repositories::{
@@ -1061,6 +1062,182 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
             } else {
                 Err(format!("Connection failed: {}", e))
             }
+        }
+    }
+}
+
+// ===== REMOTE WHISPER TRANSCRIPTION =====
+//
+// Settings for offloading Whisper decode to an OpenAI-compatible endpoint on
+// another machine. The endpoint URL has no column in `transcript_settings`,
+// so the whole config lives as a JSON blob in `app_settings` — see
+// `audio::transcription::remote`.
+
+/// Get the saved remote-transcription settings, or `None` if none exist yet.
+#[tauri::command]
+pub async fn api_get_remote_whisper_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RemoteWhisperConfig>, String> {
+    log_info!("api_get_remote_whisper_config called (native)");
+
+    SettingsRepository::get_setting::<RemoteWhisperConfig>(
+        &state.db_manager.pool(),
+        crate::audio::transcription::remote::REMOTE_WHISPER_SETTING_KEY,
+    )
+    .await
+    .map_err(|e| {
+        log_error!("Failed to read remote whisper config: {}", e);
+        e.to_string()
+    })
+}
+
+/// Save the remote-transcription settings.
+///
+/// Validated before writing so an unreachable-by-construction endpoint (bad
+/// scheme, empty host) is rejected at save time rather than at record time.
+#[tauri::command]
+pub async fn api_save_remote_whisper_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    config: RemoteWhisperConfig,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_save_remote_whisper_config called (native) for endpoint '{}'",
+        &config.base_url
+    );
+
+    RemoteWhisperClient::new(config.clone()).map_err(|e| e.to_string())?;
+
+    SettingsRepository::set_setting(
+        &state.db_manager.pool(),
+        crate::audio::transcription::remote::REMOTE_WHISPER_SETTING_KEY,
+        &config,
+    )
+    .await
+    .map_err(|e| {
+        log_error!("Failed to save remote whisper config: {}", e);
+        e.to_string()
+    })?;
+
+    log_info!("Successfully saved remote transcription configuration.");
+    Ok(serde_json::json!({
+        "status": "success",
+        "message": "Remote transcription settings saved"
+    }))
+}
+
+/// Test a remote-transcription endpoint without saving it.
+///
+/// Sends a short burst of silence through the real transcription path, so a
+/// pass means host, path, auth, and model are all actually usable — not just
+/// that something is listening on the port.
+#[tauri::command]
+pub async fn api_test_remote_whisper<R: Runtime>(
+    _app: AppHandle<R>,
+    config: RemoteWhisperConfig,
+) -> Result<String, String> {
+    log_info!(
+        "api_test_remote_whisper called (native) for endpoint '{}'",
+        &config.base_url
+    );
+
+    let client = RemoteWhisperClient::new(config).map_err(|e| e.to_string())?;
+    match client.health_check().await {
+        Ok(()) => {
+            log_info!("✅ Remote transcription endpoint reachable");
+            Ok(format!(
+                "Connected to {} (model '{}')",
+                client.base_url(),
+                client.model()
+            ))
+        }
+        Err(e) => {
+            log_warn!("⚠️ Remote transcription test failed: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+// ===== REMOTE WHISPER MODEL MANAGEMENT =====
+//
+// Speaches (and API-compatible servers) expose the server's own model store
+// over HTTP, so the remote endpoint's models can be browsed, downloaded, and
+// deleted from here the same way the local Whisper models are. Each command
+// takes the config rather than reading the saved one, so the browser works
+// before the endpoint has been saved.
+
+/// List the models installed on, loaded by, and downloadable from a remote
+/// endpoint.
+///
+/// A server that only implements transcription answers with
+/// `supported: false` and empty lists rather than an error.
+#[tauri::command]
+pub async fn api_remote_whisper_models<R: Runtime>(
+    _app: AppHandle<R>,
+    config: RemoteWhisperConfig,
+) -> Result<RemoteModelCatalog, String> {
+    log_info!(
+        "api_remote_whisper_models called (native) for endpoint '{}'",
+        &config.base_url
+    );
+
+    let client = RemoteWhisperClient::new(config).map_err(|e| e.to_string())?;
+    client.model_catalog().await.map_err(|e| {
+        log_warn!("Failed to list remote models: {}", e);
+        e.to_string()
+    })
+}
+
+/// Ask a remote endpoint to download `model_id` into its own model store.
+///
+/// The server pulls the weights synchronously with no progress channel, so
+/// this call can sit for minutes on a multi-GB model.
+#[tauri::command]
+pub async fn api_remote_whisper_download_model<R: Runtime>(
+    _app: AppHandle<R>,
+    config: RemoteWhisperConfig,
+    model_id: String,
+) -> Result<String, String> {
+    log_info!(
+        "api_remote_whisper_download_model called (native) for '{}'",
+        &model_id
+    );
+
+    let client = RemoteWhisperClient::new(config).map_err(|e| e.to_string())?;
+    match client.download_model(&model_id).await {
+        Ok(()) => {
+            log_info!("✅ Remote model '{}' downloaded", model_id);
+            Ok(format!("'{}' is ready on the server", model_id))
+        }
+        Err(e) => {
+            log_error!("Failed to download remote model '{}': {}", model_id, e);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Delete `model_id` from a remote endpoint's model store.
+#[tauri::command]
+pub async fn api_remote_whisper_delete_model<R: Runtime>(
+    _app: AppHandle<R>,
+    config: RemoteWhisperConfig,
+    model_id: String,
+) -> Result<String, String> {
+    log_info!(
+        "api_remote_whisper_delete_model called (native) for '{}'",
+        &model_id
+    );
+
+    let client = RemoteWhisperClient::new(config).map_err(|e| e.to_string())?;
+    match client.delete_model(&model_id).await {
+        Ok(()) => {
+            log_info!("🗑️ Remote model '{}' deleted", model_id);
+            Ok(format!("'{}' removed from the server", model_id))
+        }
+        Err(e) => {
+            log_error!("Failed to delete remote model '{}': {}", model_id, e);
+            Err(e.to_string())
         }
     }
 }

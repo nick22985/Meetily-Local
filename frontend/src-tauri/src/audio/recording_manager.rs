@@ -3,6 +3,7 @@ use log::{debug, error, info};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use super::device_follower::ActiveRoute;
 use super::devices::{AudioDevice, DeviceType};
 use super::pipeline::AudioPipelineManager;
 use super::recording_saver::RecordingSaver;
@@ -92,26 +93,20 @@ impl RecordingManager {
         // The pipeline uses device kind (Bluetooth vs Wired) to apply adaptive buffering:
         // - Bluetooth: Larger buffers (80-200ms) to handle jitter
         // - Wired: Smaller buffers (20-50ms) for low latency
-        let (mic_name, mic_kind) = if let Some(ref mic) = microphone_device {
-            let device_kind =
-                super::device_detection::InputDeviceKind::detect(&mic.name, 512, 48000);
-            (mic.name.clone(), device_kind)
-        } else {
-            (
-                "No Microphone".to_string(),
-                super::device_detection::InputDeviceKind::Unknown,
-            )
+        let (mic_name, mic_kind) = match microphone_device {
+            Some(ref mic) => (
+                Some(mic.name.clone()),
+                super::device_detection::InputDeviceKind::detect(&mic.name, 512, 48000),
+            ),
+            None => (None, super::device_detection::InputDeviceKind::Unknown),
         };
 
-        let (sys_name, sys_kind) = if let Some(ref sys) = system_device {
-            let device_kind =
-                super::device_detection::InputDeviceKind::detect(&sys.name, 512, 48000);
-            (sys.name.clone(), device_kind)
-        } else {
-            (
-                "No System Audio".to_string(),
-                super::device_detection::InputDeviceKind::Unknown,
-            )
+        let (sys_name, sys_kind) = match system_device {
+            Some(ref sys) => (
+                Some(sys.name.clone()),
+                super::device_detection::InputDeviceKind::detect(&sys.name, 512, 48000),
+            ),
+            None => (None, super::device_detection::InputDeviceKind::Unknown),
         };
 
         // Update recording metadata with device information
@@ -155,9 +150,11 @@ impl RecordingManager {
 
     /// Start recording with the system default source + sink monitor.
     ///
-    /// PipeWire resolves `"default"` to the user's currently selected
-    /// default source/sink and reroutes streams if the default changes
-    /// mid-recording — no Bluetooth-override heuristics needed.
+    /// The `"default"` selection is resolved against the PipeWire graph
+    /// at open time and re-checked while recording by
+    /// [`crate::audio::device_follower`], so changing the system default
+    /// mid-recording moves the capture with it — no Bluetooth-override
+    /// heuristics needed.
     pub async fn start_recording_with_defaults_and_auto_save(
         &mut self,
         auto_save: bool,
@@ -368,6 +365,11 @@ impl RecordingManager {
     /// Get active stream count
     pub fn active_stream_count(&self) -> usize {
         self.stream_manager.active_stream_count()
+    }
+
+    /// The nodes the capture is currently reading from.
+    pub fn active_route(&self) -> ActiveRoute {
+        self.stream_manager.active_route()
     }
 
     /// Set error callback for handling errors

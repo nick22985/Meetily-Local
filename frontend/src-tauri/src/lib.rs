@@ -26,6 +26,7 @@ pub mod database;
 pub mod groq;
 pub mod llm_providers;
 pub mod mcp_config;
+pub mod meeting_detector;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -535,6 +536,7 @@ pub fn run() {
         .manage(summary::summary_engine::ModelManagerState(Arc::new(
             tokio::sync::Mutex::new(None),
         )))
+        .manage(meeting_detector::MeetingDetector::new())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -662,6 +664,28 @@ pub fn run() {
                 }
             });
 
+            // Mirror the per-app capture switch into its process-global
+            // flag, so a stream opened before the settings screen is ever
+            // visited honours the stored preference. Also needs the
+            // database, hence its place after the init above.
+            let app_for_prefs = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) =
+                    audio::recording_preferences::load_recording_preferences(&app_for_prefs).await
+                {
+                    log::warn!("Could not load recording preferences at startup: {}", e);
+                }
+            });
+
+            // Start automatic meeting detection if the user enabled it. Must
+            // come after the database init above — the detector reads its
+            // settings from `app_settings`.
+            let app_for_detector = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let detector = app_for_detector.state::<meeting_detector::MeetingDetector>();
+                detector.initialize(&app_for_detector).await;
+            });
+
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");
             if let Ok(resource_path) = _app.handle().path().resource_dir() {
@@ -688,6 +712,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             stop_recording,
             is_recording,
+            audio::recording_commands::resolve_capture_route,
             get_transcription_status,
             read_audio_file,
             save_transcript,
@@ -752,6 +777,12 @@ pub fn run() {
             // api::api_save_auto_generate_setting,
             api::api_get_transcript_config,
             api::api_save_transcript_config,
+            api::api_get_remote_whisper_config,
+            api::api_save_remote_whisper_config,
+            api::api_test_remote_whisper,
+            api::api_remote_whisper_models,
+            api::api_remote_whisper_download_model,
+            api::api_remote_whisper_delete_model,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
             api::api_get_meeting,
@@ -808,6 +839,7 @@ pub fn run() {
             audio::recording_preferences::get_default_recordings_folder_path,
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::select_recording_folder,
+            audio::app_audio::list_app_audio_sources,
             // Language preference commands
             set_language_preference,
             // Notification system commands
@@ -825,6 +857,11 @@ pub fn run() {
             notifications::commands::initialize_notification_manager_manual,
             notifications::commands::test_notification_with_auto_consent,
             notifications::commands::get_notification_stats,
+            meeting_detector::commands::api_get_meeting_detection_settings,
+            meeting_detector::commands::api_set_meeting_detection_settings,
+            meeting_detector::commands::api_get_meeting_detection_status,
+            meeting_detector::commands::api_list_meeting_apps,
+            meeting_detector::commands::api_probe_capture_streams,
             // Database import commands
             database::commands::check_first_launch,
             database::commands::initialize_fresh_database,

@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
 
+use super::device_follower::ActiveRoute;
+use super::device_mode::DeviceMode;
 use super::devices::{AudioDevice, DeviceType};
+use super::pw::{self, PwDeviceKind};
 use super::RecordingManager;
 
 // Import transcription modules
@@ -800,6 +803,40 @@ pub async fn is_recording() -> bool {
         .as_ref()
         .map(|m| m.is_recording())
         .unwrap_or(false)
+}
+
+/// Which nodes the given selections currently point at.
+///
+/// While recording this reports where the capture streams actually are,
+/// which is the answer that matters — the follower may have moved them
+/// since the recording started. Otherwise the selections are resolved
+/// against a fresh graph snapshot so the picker can show what
+/// "Default" / "Follow the active call" would pick right now.
+#[tauri::command]
+pub async fn resolve_capture_route(
+    microphone: Option<String>,
+    system: Option<String>,
+) -> Result<ActiveRoute, String> {
+    if let Some(route) = {
+        let guard = RECORDING_MANAGER.lock().unwrap();
+        guard.as_ref().map(|m| m.active_route())
+    } {
+        return Ok(route);
+    }
+
+    let snapshot = tokio::task::spawn_blocking(pw::snapshot_graph)
+        .await
+        .map_err(|e| format!("Graph lookup did not finish: {}", e))?
+        .map_err(|e| format!("Could not read the audio graph: {}", e))?;
+
+    let resolve = |selection: Option<String>, kind| {
+        selection.and_then(|id| DeviceMode::parse(&id).resolve(kind, &snapshot))
+    };
+
+    Ok(ActiveRoute {
+        microphone: resolve(microphone, PwDeviceKind::Microphone),
+        system: resolve(system, PwDeviceKind::System),
+    })
 }
 
 /// Get recording statistics

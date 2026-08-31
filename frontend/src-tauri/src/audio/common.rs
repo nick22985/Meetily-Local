@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::audio::transcription::TranscriptionEngine;
 use crate::speaker_diarization::Diarizer;
-use crate::whisper_engine::WhisperEngine;
 
 /// Unload the Whisper model after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
@@ -100,8 +100,9 @@ pub struct TranscriptSegment {
     pub voice_profile_id: Option<String>,
     /// Audio-stream this segment came from: "mic" or "system". Set by the
     /// live-recording path (which knows the capture source); left `None` by
-    /// batch/import paths that read the mixed-down audio. Drives source-aware
-    /// per-segment playback (mic = left channel, system = right).
+    /// batch/import paths that read the mixed-down audio. Also drives
+    /// per-segment playback on recordings made before the mono mixdown,
+    /// which kept the mic on the left channel and the system on the right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -343,15 +344,20 @@ pub(crate) fn log_vad_diagnostics(speech_segments: &[crate::audio::vad::SpeechSe
 /// percentage range). VAD itself (and the zero-segments decision: import
 /// continues with an empty transcript + a warning event, retranscription
 /// treats it as a hard error) stays in the caller, since folding VAD in here
-/// would force both callers to acquire a Whisper engine + diarizer even when
-/// VAD finds nothing to transcribe.
+/// would force both callers to acquire a transcription engine + diarizer even
+/// when VAD finds nothing to transcribe.
+///
+/// `transcription_engine` may be local or remote — see
+/// [`transcription::get_or_init_batch_engine`].
+///
+/// [`transcription::get_or_init_batch_engine`]: crate::audio::transcription::get_or_init_batch_engine
 ///
 /// `on_segment_progress(index, total, duration_secs)` is invoked once per
 /// processable segment, right before it's transcribed.
 pub(crate) async fn run_batch_transcription(
     speech_segments: &[crate::audio::vad::SpeechSegment],
     language: Option<String>,
-    whisper_engine: Arc<WhisperEngine>,
+    transcription_engine: TranscriptionEngine,
     diarizer: Option<Arc<Diarizer>>,
     cancel_flag: &'static AtomicBool,
     on_segment_progress: impl Fn(usize, usize, f64),
@@ -414,10 +420,17 @@ pub(crate) async fn run_batch_transcription(
         } else {
             Some(context_tail.clone())
         };
-        let (text, conf, _) = whisper_engine
+        let (text, conf, _) = transcription_engine
             .transcribe_audio_with_confidence(segment.samples.clone(), language.clone(), prompt)
             .await
-            .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "{} transcription failed on segment {}: {}",
+                    transcription_engine.provider_name(),
+                    i,
+                    e
+                )
+            })?;
 
         // Same hallucination screen as the live path.
         if crate::audio::transcription::worker::is_likely_hallucination(&text, conf) {

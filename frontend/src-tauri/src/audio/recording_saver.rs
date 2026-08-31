@@ -240,11 +240,8 @@ impl RecordingSaver {
 
         // Only initialize incremental saver if checkpoints are needed (auto_save is true)
         if create_checkpoints {
-            // Stereo: mic on the left channel, system on the right (the
-            // pipeline interleaves them). Keeps the two sources separable for
-            // source-aware playback instead of pre-mixing to mono.
-            let incremental_saver =
-                IncrementalAudioSaver::new(meeting_folder.clone(), 48000, 2)?;
+            // Mono: the pipeline mixes mic and system down to one channel.
+            let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000, 1)?;
             self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
             info!(
                 "✅ Incremental audio saver initialized for meeting: {}",

@@ -23,7 +23,8 @@ pub struct IncrementalAudioSaver {
     checkpoints_dir: PathBuf,
     meeting_folder: PathBuf,
     sample_rate: u32,
-    /// Interleaved channel count of the incoming chunks (2 = stereo mic/system).
+    /// Interleaved channel count of the incoming chunks (1 = the mixed-down
+    /// mono recording; 2 = a legacy stereo mic-left/system-right one).
     channels: u16,
 }
 
@@ -33,8 +34,8 @@ impl IncrementalAudioSaver {
     /// # Arguments
     /// * `meeting_folder` - Path to the meeting folder (contains .checkpoints/)
     /// * `sample_rate` - Sample rate of audio (typically 48000)
-    /// * `channels` - Interleaved channel count of the chunks (2 for the
-    ///   stereo mic-left/system-right recording; 1 for legacy mono callers)
+    /// * `channels` - Interleaved channel count of the chunks (1 for the
+    ///   mixed-down mono recording; 2 for a legacy stereo mic/system one)
     pub fn new(meeting_folder: PathBuf, sample_rate: u32, channels: u16) -> Result<Self> {
         let checkpoints_dir = meeting_folder.join(".checkpoints");
 

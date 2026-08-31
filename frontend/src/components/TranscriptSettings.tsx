@@ -11,11 +11,13 @@ import { Input } from "./ui/input";
 import { Button } from "./ui/button";
 import { Eye, EyeOff, Lock, Unlock } from "lucide-react";
 import { ModelManager } from "./WhisperModelManager";
+import { RemoteWhisperSettings } from "./RemoteWhisperSettings";
 import { SettingsCard } from "@/app/settings/parts/SettingsCard";
 
 export interface TranscriptModelProps {
   provider:
     | "localWhisper"
+    | "remoteWhisper"
     | "deepgram"
     | "elevenLabs"
     | "groq"
@@ -56,7 +58,10 @@ export function TranscriptSettings({
 
   // Clear API key when switching to a provider that doesn't use one
   useEffect(() => {
-    if (transcriptModelConfig.provider === "localWhisper") {
+    if (
+      transcriptModelConfig.provider === "localWhisper" ||
+      transcriptModelConfig.provider === "remoteWhisper"
+    ) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setApiKey(null);
     }
@@ -76,6 +81,7 @@ export function TranscriptSettings({
   };
   const modelOptions = {
     localWhisper: [], // Model selection handled by ModelManager component
+    remoteWhisper: [], // Model is a free-text field in RemoteWhisperSettings
     deepgram: ["nova-2-phonecall"],
     elevenLabs: ["eleven_multilingual_v2"],
     groq: ["llama-3.3-70b-versatile"],
@@ -130,7 +136,7 @@ export function TranscriptSettings({
             onValueChange={(value) => {
               const provider = value as TranscriptModelProps["provider"];
               setUiProvider(provider);
-              if (provider !== "localWhisper") {
+              if (provider !== "localWhisper" && provider !== "remoteWhisper") {
                 fetchApiKey(provider);
               }
             }}
@@ -145,6 +151,9 @@ export function TranscriptSettings({
               <SelectItem value="localWhisper">
                 🏠 Local Whisper (High Accuracy)
               </SelectItem>
+              <SelectItem value="remoteWhisper">
+                🖧 Remote Whisper (another machine)
+              </SelectItem>
               {/* Cloud providers can be re-enabled here once their flows are
                   wired:
                   <SelectItem value="deepgram">☁️ Deepgram</SelectItem>
@@ -154,7 +163,7 @@ export function TranscriptSettings({
             </SelectContent>
           </Select>
 
-          {uiProvider !== "localWhisper" && (
+          {uiProvider !== "localWhisper" && uiProvider !== "remoteWhisper" && (
             <Select
               value={transcriptModelConfig.model}
               onValueChange={(value) => {
@@ -183,6 +192,19 @@ export function TranscriptSettings({
           )}
         </div>
       </SettingsCard>
+
+      {uiProvider === "remoteWhisper" && (
+        <RemoteWhisperSettings
+          onSaved={(model) =>
+            setTranscriptModelConfig({
+              ...transcriptModelConfig,
+              provider: "remoteWhisper",
+              model,
+              apiKey: null,
+            })
+          }
+        />
+      )}
 
       {uiProvider === "localWhisper" && (
         <SettingsCard

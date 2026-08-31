@@ -37,6 +37,15 @@ pub struct RecordingPreferences {
     /// transcript is unaffected when off. Defaults on.
     #[serde(default = "default_true")]
     pub streaming_partials: bool,
+    /// Allow the system-audio side to capture one application instead of
+    /// the whole sink mix (an `app:<key>` selection — see
+    /// [`crate::audio::app_audio`]). Off by default: tapping an app's
+    /// output ports is a good deal more moving parts than reading a
+    /// monitor, and turning this off puts every selection back on the
+    /// ordinary path without the user having to find which one caused the
+    /// trouble.
+    #[serde(default)]
+    pub app_audio_capture: bool,
 }
 
 fn default_true() -> bool {
@@ -54,6 +63,7 @@ impl Default for RecordingPreferences {
             show_recording_notification: true,
             auto_refine: true,
             streaming_partials: true,
+            app_audio_capture: false,
         }
     }
 }
@@ -185,6 +195,9 @@ pub async fn load_recording_preferences<R: Runtime>(
     info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
           prefs.save_folder, prefs.auto_save, prefs.file_format,
           prefs.preferred_mic_device, prefs.preferred_system_device);
+    // Streams are opened from places with no route to the database, so
+    // the switch is mirrored into a process-global flag.
+    crate::audio::app_audio::set_enabled(prefs.app_audio_capture);
     Ok(prefs)
 }
 
@@ -204,6 +217,8 @@ pub async fn save_recording_preferences<R: Runtime>(
         .map_err(|e| anyhow!("Failed to save recording preferences: {}", e))?;
 
     info!("Successfully persisted recording preferences to database");
+
+    crate::audio::app_audio::set_enabled(preferences.app_audio_capture);
 
     // Ensure the directory exists
     ensure_recordings_directory(&preferences.save_folder)?;

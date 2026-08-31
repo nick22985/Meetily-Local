@@ -20,8 +20,9 @@ interface SegmentAudioValue {
   /** Segment key whose clip is being extracted, or null. */
   loadingKey: string | null;
   /** Play `[startSecs, endSecs]` of the meeting's audio for `key`, or stop it
-   *  if that key is already the active one. `source` ("mic" | "system") selects
-   *  the matching channel of the stereo recording; omit to play a mono downmix. */
+   *  if that key is already the active one. Recordings are mono, so `source`
+   *  ("mic" | "system") only matters for ones made before the mixdown, where
+   *  it picks the channel that source was captured on. */
   toggle: (
     key: string,
     meetingId: string,

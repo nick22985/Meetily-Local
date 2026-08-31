@@ -4,15 +4,12 @@ use super::common::{create_transcript_segments, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::audio::decoder::{decode_audio_file_with_progress, ProgressCallback};
 use crate::audio::vad::get_speech_chunks_with_progress;
-use crate::config::DEFAULT_WHISPER_MODEL;
 use crate::state::AppState;
-use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Global flag to track if retranscription is in progress
@@ -199,8 +196,6 @@ async fn run_retranscription<R: Runtime>(
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
 
-    // `provider` is accepted for backward-compat but only Whisper is supported now.
-    let _ = provider;
     info!(
         "Starting retranscription for meeting {} with language {:?}, model {:?}",
         meeting_id, language, model
@@ -321,8 +316,15 @@ async fn run_retranscription<R: Runtime>(
         "Loading transcription engine...",
     );
 
-    // Initialize Whisper once (not per-segment)
-    let whisper_engine = Some(get_or_init_whisper(&app, model.as_deref()).await?);
+    // Initialize the transcription backend once (not per-segment). May be
+    // local Whisper or a remote endpoint, depending on the picker / saved
+    // config.
+    let transcription_engine = crate::audio::transcription::get_or_init_batch_engine(
+        &app,
+        provider.as_deref(),
+        model.as_deref(),
+    )
+    .await?;
 
     // Build a fresh diarizer for this batch (None if speaker model isn't
     // downloaded). The mixed-audio source means we can't recover mic vs
@@ -347,15 +349,12 @@ async fn run_retranscription<R: Runtime>(
     // Split-at-silence -> per-segment transcribe -> diarize is shared with
     // audio import (see `common::run_batch_transcription`); only the
     // progress-event shape/percentage range differs here.
-    let engine = whisper_engine
-        .clone()
-        .expect("whisper_engine is always Some at this point");
     let app_for_progress = app.clone();
     let meeting_id_for_progress = meeting_id.clone();
     let batch_result = super::common::run_batch_transcription(
         &speech_segments,
         language.clone(),
-        engine,
+        transcription_engine,
         diarizer.clone(),
         &RETRANSCRIPTION_CANCELLED,
         move |i, total, segment_duration_sec| {
@@ -561,125 +560,6 @@ fn emit_progress<R: Runtime>(
     );
 }
 
-/// Get or initialize the Whisper engine, auto-loading the model if needed
-/// If `requested_model` is provided, ensures that specific model is loaded
-async fn get_or_init_whisper<R: Runtime>(
-    app: &AppHandle<R>,
-    requested_model: Option<&str>,
-) -> Result<Arc<WhisperEngine>> {
-    use crate::whisper_engine::commands::WHISPER_ENGINE;
-
-    let engine = {
-        let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-
-    match engine {
-        Some(e) => {
-            // Determine which model to use
-            let target_model = match requested_model {
-                Some(model) => model.to_string(),
-                None => get_configured_whisper_model(app).await?,
-            };
-
-            // Check if the correct model is already loaded
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
-
-            if needs_load {
-                info!(
-                    "Loading Whisper model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                // Discover available models first (populates the internal cache)
-                info!("Discovering available Whisper models...");
-                if let Err(discover_err) = e.discover_models().await {
-                    warn!(
-                        "Error during model discovery (continuing anyway): {}",
-                        discover_err
-                    );
-                }
-
-                match e.load_model(&target_model).await {
-                    Ok(_) => {
-                        info!("Whisper model '{}' loaded successfully", target_model);
-                        Ok(e)
-                    }
-                    Err(load_err) => {
-                        error!(
-                            "Failed to load Whisper model '{}': {}",
-                            target_model, load_err
-                        );
-                        Err(anyhow!(
-                            "Failed to load Whisper model '{}': {}",
-                            target_model,
-                            load_err
-                        ))
-                    }
-                }
-            } else {
-                info!("Whisper model '{}' already loaded", target_model);
-                Ok(e)
-            }
-        }
-        None => Err(anyhow!("Whisper engine not initialized")),
-    }
-}
-
-/// Get the configured Whisper model name from the database
-async fn get_configured_whisper_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
-    debug!("Getting configured Whisper model from database...");
-
-    let app_state = app.try_state::<AppState>().ok_or_else(|| {
-        error!("App state not available");
-        anyhow!("App state not available")
-    })?;
-
-    debug!("Querying transcript_settings table...");
-
-    // Query the transcript settings from the database - get both provider and model
-    let result: Option<(String, String)> =
-        sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
-            .fetch_optional(app_state.db_manager.pool())
-            .await
-            .map_err(|e| {
-                error!("Failed to query transcript config: {}", e);
-                anyhow!("Failed to query transcript config: {}", e)
-            })?;
-
-    match result {
-        Some((provider, model)) => {
-            info!(
-                "Found transcript config: provider={}, model={}",
-                provider, model
-            );
-
-            // Check if provider is Whisper-based
-            if provider == "localWhisper" || provider == "whisper" {
-                Ok(model)
-            } else {
-                error!(
-                    "Retranscription requires Whisper provider, but configured provider is: {}",
-                    provider
-                );
-                Err(anyhow!("Retranscription requires Whisper. Current provider '{}' does not support retranscription with language selection.", provider))
-            }
-        }
-        None => {
-            // Default to configured Whisper model if no config exists
-            warn!(
-                "No transcript config found, using default model '{}'",
-                DEFAULT_WHISPER_MODEL
-            );
-            Ok(DEFAULT_WHISPER_MODEL.to_string())
-        }
-    }
-}
-
 // ============================================================================
 // POST-MEETING AUTO-REFINE
 //
@@ -741,9 +621,20 @@ async fn run_auto_refine<R: Runtime>(
         ));
     }
 
+    // Auto-refine is a local-model concept: it upgrades a fast local model
+    // to a bigger one on the same machine. A remote endpoint serves whatever
+    // model it was started with, and naming a different one here would just
+    // ask it for a model it doesn't have.
+    let provider = crate::audio::transcription::engine::configured_provider(&app).await;
+    if provider == crate::audio::transcription::REMOTE_WHISPER_PROVIDER {
+        return Err(anyhow!(
+            "transcription runs on a remote endpoint; model choice is the server's, nothing to refine"
+        ));
+    }
+
     // Which model was used live? Only worth refining if a strictly
     // higher-accuracy one is available.
-    let live_model = get_configured_whisper_model(&app).await?;
+    let live_model = crate::audio::transcription::engine::configured_local_model(&app).await;
     if AUTO_REFINE_MODEL_CANDIDATES.contains(&live_model.as_str()) {
         return Err(anyhow!(
             "live model '{}' is already the high-accuracy tier, nothing to gain",
@@ -787,7 +678,7 @@ async fn run_auto_refine<R: Runtime>(
         meeting_folder_path.clone(),
         None, // language: keep whatever auto-detect the live pass used
         Some(target_model.clone()),
-        None,
+        Some("localWhisper".to_string()),
     )
     .await;
 

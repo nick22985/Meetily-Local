@@ -126,7 +126,7 @@ export interface TranscriptSegmentData {
   speaker?: string;
   /** FK to a stored voice profile when matched. */
   voice_profile_id?: string;
-  /** Audio stream ("mic" | "system") this segment came from. Selects the
-   *  matching channel of the stereo recording for source-aware playback. */
+  /** Audio stream ("mic" | "system") this segment came from. On recordings
+   *  made before the mono mixdown, selects the channel to play back from. */
   source?: string;
 }

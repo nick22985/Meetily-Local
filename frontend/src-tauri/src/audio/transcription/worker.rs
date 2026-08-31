@@ -316,9 +316,13 @@ async fn process_chunk<R: Runtime>(
             }
         };
 
-    // Provider-aware confidence threshold
+    // Provider-aware confidence threshold. The remote backend reconstructs
+    // confidence from the same decoder signals (avg_logprob / no_speech_prob)
+    // the local engine reads directly, so the scale — and the threshold — is
+    // the same. Servers that report no signals return a neutral 0.5, which
+    // clears this bar rather than silently dropping every segment.
     let confidence_threshold = match engine {
-        TranscriptionEngine::Whisper(_) => 0.3,
+        TranscriptionEngine::Whisper(_) | TranscriptionEngine::Remote(_) => 0.3,
     };
     let confidence_str = match confidence_opt {
         Some(c) => format!("{:.2}", c),
@@ -572,48 +576,68 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
         return Ok((String::new(), Some(1.0), false));
     }
 
-    // Transcribe using the appropriate engine (with improved error handling)
-    match engine {
-        TranscriptionEngine::Whisper(whisper_engine) => {
-            // Get language preference from global state
-            let language = crate::get_language_preference_internal();
+    // Transcribe on the configured backend. Which one it is (in-process
+    // whisper-rs, or a remote endpoint on another machine) is entirely the
+    // engine's concern — everything above and below this call is identical
+    // either way.
+    let language = crate::get_language_preference_internal();
 
-            match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language, context_prompt)
-                .await
-            {
-                Ok((text, confidence, is_partial)) => {
-                    let cleaned_text = text.trim().to_string();
-                    if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
-                    }
-
-                    info!(
-                        "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
-                        chunk.chunk_id, cleaned_text, confidence, is_partial
-                    );
-
-                    Ok((cleaned_text, Some(confidence), is_partial))
-                }
-                Err(e) => {
-                    error!(
-                        "Whisper transcription failed for chunk {}: {}",
-                        chunk.chunk_id, e
-                    );
-
-                    let transcription_error = TranscriptionError::EngineFailed(e.to_string());
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false
-                        }),
-                    );
-
-                    Err(transcription_error)
-                }
+    match engine
+        .transcribe_audio_with_confidence(speech_samples, language, context_prompt)
+        .await
+    {
+        Ok((text, confidence, is_partial)) => {
+            let cleaned_text = text.trim().to_string();
+            if cleaned_text.is_empty() {
+                return Ok((String::new(), Some(confidence), is_partial));
             }
+
+            info!(
+                "{} transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
+                engine.provider_name(),
+                chunk.chunk_id,
+                cleaned_text,
+                confidence,
+                is_partial
+            );
+
+            Ok((cleaned_text, Some(confidence), is_partial))
+        }
+        Err(e) => {
+            error!(
+                "{} transcription failed for chunk {}: {}",
+                engine.provider_name(),
+                chunk.chunk_id,
+                e
+            );
+
+            let transcription_error = TranscriptionError::EngineFailed(e.to_string());
+
+            // A remote failure is usually the network or the other machine
+            // being down — something the user can actually act on, and worth
+            // saying so, since the recording keeps going and the audio is
+            // still saved for a later retranscribe.
+            let is_remote = matches!(engine, TranscriptionEngine::Remote(_));
+            let user_message = if is_remote {
+                format!(
+                    "Remote transcription failed: {}. Recording continues \u{2014} the audio is \
+                     saved and can be retranscribed once the server is reachable.",
+                    e
+                )
+            } else {
+                format!("Transcription failed: {}", transcription_error)
+            };
+
+            let _ = app.emit(
+                "transcription-error",
+                &serde_json::json!({
+                    "error": transcription_error.to_string(),
+                    "userMessage": user_message,
+                    "actionable": is_remote
+                }),
+            );
+
+            Err(transcription_error)
         }
     }
 }

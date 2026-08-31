@@ -12,7 +12,8 @@ interface RawModelInfo {
 }
 
 export interface ModelOption {
-  provider: "whisper";
+  /** Matches the provider string the Rust batch commands expect. */
+  provider: "whisper" | "remoteWhisper";
   name: string;
   displayName: string;
   size_mb: number;
@@ -24,10 +25,16 @@ interface TranscriptModelConfig {
 }
 
 /**
- * Custom hook for fetching and managing local Whisper transcription models.
+ * Custom hook for fetching and managing transcription models offered by the
+ * import and retranscription dialogs.
  *
  * This hook centralizes the model fetching logic that was previously duplicated
  * in ImportAudioDialog and RetranscribeDialog components.
+ *
+ * Locally downloaded Whisper models are always listed. When the configured
+ * provider is the remote endpoint, its model is listed too and selected by
+ * default — but the local ones stay available, so a batch job can still be run
+ * on this machine when the remote server is unreachable.
  *
  * @param transcriptModelConfig - User's saved model configuration from context
  * @returns Object containing available models, selected model key, loading state, and fetch function
@@ -69,19 +76,28 @@ export function useTranscriptionModels(
       console.error("Failed to fetch Whisper models:", err);
     }
 
-    setAvailableModels(allModels);
-
-    // Set default model based on user's saved configuration
     const configuredProvider = transcriptModelConfig?.provider || "";
     const configuredModel = transcriptModelConfig?.model || "";
+
+    if (configuredProvider === "remoteWhisper" && configuredModel) {
+      allModels.unshift({
+        provider: "remoteWhisper" as const,
+        name: configuredModel,
+        displayName: `🖧 Remote: ${configuredModel}`,
+        size_mb: 0,
+      });
+    }
+
+    setAvailableModels(allModels);
 
     // Try to match the configured model.
     // Note: 'localWhisper' in saved config maps to 'whisper' provider in model list.
     const configuredMatch = allModels.find(
       (m) =>
-        configuredProvider === "localWhisper" &&
-        m.provider === "whisper" &&
-        m.name === configuredModel,
+        m.name === configuredModel &&
+        ((configuredProvider === "localWhisper" && m.provider === "whisper") ||
+          (configuredProvider === "remoteWhisper" &&
+            m.provider === "remoteWhisper")),
     );
 
     // Only set default model if user hasn't manually selected one
