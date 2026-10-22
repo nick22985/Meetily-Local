@@ -9,6 +9,9 @@ export interface VoiceProfile {
   email: string | null;
   embedding_dim: number;
   sample_count: number;
+  /** Speaker embedding model the profile was built with. Profiles from a
+   *  model other than the active one aren't recognised until re-recorded. */
+  embedding_model: string;
   created_at: string;
   updated_at: string;
 }

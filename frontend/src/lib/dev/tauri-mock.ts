@@ -175,6 +175,29 @@ const COMMAND_DEFAULTS: Record<string, Default> = {
   list_open_action_items: () => SAMPLE_ACTION_ITEMS,
   list_meeting_notes: () => [],
   list_voice_profiles: () => [],
+  api_get_speaker_diarization_settings: () => ({
+    embedding_model: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+    separate_sources: false,
+  }),
+  api_set_speaker_diarization_settings: null,
+  api_list_speaker_embedding_models: () => [
+    {
+      filename: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+      display_name: "3D-Speaker CAM++ (default)",
+      size_mb: 28,
+      description: "Fast and small. Good default for most meetings.",
+      downloaded: true,
+      active: true,
+    },
+  ],
+  speaker_model_status: () => ({
+    model_filename: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+    model_path: "/tmp/parley-dev/speaker_models",
+    is_ready: true,
+    download_url: "",
+    segmentation_ready: true,
+  }),
+  speaker_model_download: null,
 
   // --- Meeting details (empty meeting → page shows its spinner guard) -------
   // metadata: null makes the derived `meeting` null, so page.tsx renders its

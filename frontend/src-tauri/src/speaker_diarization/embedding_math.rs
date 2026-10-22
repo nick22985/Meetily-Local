@@ -49,6 +49,35 @@ pub fn average_and_normalize(embeddings: &[Vec<f32>]) -> Vec<f32> {
     acc
 }
 
+/// Weighted average of a set of embeddings, L2-normalized. Used wherever a
+/// centroid is built from segments of different lengths: a 6s segment's
+/// embedding is far more reliable than a 0.8s one and should pull the
+/// centroid harder. Non-positive weights are ignored; if every weight is
+/// non-positive this falls back to the unweighted average.
+pub fn weighted_average_and_normalize(embeddings: &[Vec<f32>], weights: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(embeddings.len(), weights.len());
+    if embeddings.is_empty() {
+        return Vec::new();
+    }
+    let total: f32 = weights.iter().filter(|w| **w > 0.0).sum();
+    if total <= 0.0 {
+        return average_and_normalize(embeddings);
+    }
+    let dim = embeddings[0].len();
+    let mut acc = vec![0.0f32; dim];
+    for (e, &w) in embeddings.iter().zip(weights) {
+        if w <= 0.0 {
+            continue;
+        }
+        debug_assert_eq!(e.len(), dim);
+        for (i, v) in e.iter().enumerate() {
+            acc[i] += v * w;
+        }
+    }
+    l2_normalize(&mut acc);
+    acc
+}
+
 /// Combine two centroid+sample-count pairs into a single L2-normalized
 /// centroid representing the union of samples.
 ///
@@ -105,6 +134,22 @@ mod tests {
         let norm = m.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
         assert!(m[0] > m[1]);
+    }
+
+    #[test]
+    fn weighted_centroid_leans_toward_heavier_embedding() {
+        let embeddings = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
+        let c = weighted_average_and_normalize(&embeddings, &[4.0, 1.0]);
+        let norm = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+        assert!(c[0] > c[1]);
+    }
+
+    #[test]
+    fn weighted_centroid_with_no_positive_weight_is_plain_average() {
+        let embeddings = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
+        let c = weighted_average_and_normalize(&embeddings, &[0.0, 0.0]);
+        assert!((c[0] - c[1]).abs() < 1e-5);
     }
 
     #[test]

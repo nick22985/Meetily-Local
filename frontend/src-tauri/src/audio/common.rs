@@ -7,7 +7,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::audio::transcription::TranscriptionEngine;
-use crate::speaker_diarization::Diarizer;
+use crate::speaker_diarization::offline::{speaker_change_points, MIN_TURN_RUN_SECS};
+use crate::speaker_diarization::{Diarizer, OfflineTurn, SegmentInfo};
 
 /// Unload the Whisper model after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
@@ -337,6 +338,20 @@ pub(crate) fn log_vad_diagnostics(speech_segments: &[crate::audio::vad::SpeechSe
     }
 }
 
+/// Run offline diarization over the batch's 16 kHz samples on a blocking
+/// thread. `None` when the models aren't on disk or the pass fails; callers
+/// then fall back to HAC.
+pub(crate) async fn offline_turns(samples_16k: Arc<Vec<f32>>) -> Option<Vec<OfflineTurn>> {
+    tokio::task::spawn_blocking(move || {
+        crate::speaker_diarization::offline::diarize_if_available(&samples_16k)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("Offline diarization task panicked: {}", e);
+        None
+    })
+}
+
 /// Shared split-at-silence -> per-segment transcribe -> diarize pipeline used
 /// by both audio import and retranscription, given VAD-detected
 /// `speech_segments`. The two callers are ~90% identical from here on; they
@@ -352,6 +367,13 @@ pub(crate) fn log_vad_diagnostics(speech_segments: &[crate::audio::vad::SpeechSe
 ///
 /// [`transcription::get_or_init_batch_engine`]: crate::audio::transcription::get_or_init_batch_engine
 ///
+/// `offline_turns` (from [`offline::diarize_if_available`] over the same
+/// audio) split segments at speaker changes and, once everything is
+/// transcribed, regroup the diarizer's labels; without them the labels are
+/// refined with HAC instead.
+///
+/// [`offline::diarize_if_available`]: crate::speaker_diarization::offline::diarize_if_available
+///
 /// `on_segment_progress(index, total, duration_secs)` is invoked once per
 /// processable segment, right before it's transcribed.
 pub(crate) async fn run_batch_transcription(
@@ -359,6 +381,7 @@ pub(crate) async fn run_batch_transcription(
     language: Option<String>,
     transcription_engine: TranscriptionEngine,
     diarizer: Option<Arc<Diarizer>>,
+    offline_turns: Option<&[OfflineTurn]>,
     cancel_flag: &'static AtomicBool,
     on_segment_progress: impl Fn(usize, usize, f64),
 ) -> Result<Vec<BatchTranscript>> {
@@ -370,6 +393,27 @@ pub(crate) async fn run_batch_transcription(
     // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
     // for the lowest-energy window near the target split point and cut there.
     const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
+
+    // One VAD segment can hold two speakers with no pause between them;
+    // cut it where the offline pass says the speaker changes.
+    let turn_split: Vec<crate::audio::vad::SpeechSegment>;
+    let speech_segments = match offline_turns {
+        Some(turns) => {
+            turn_split = speech_segments
+                .iter()
+                .flat_map(|s| split_segment_at_turns(s, turns))
+                .collect();
+            if turn_split.len() > speech_segments.len() {
+                info!(
+                    "Split {} VAD segments into {} at speaker changes",
+                    speech_segments.len(),
+                    turn_split.len()
+                );
+            }
+            &turn_split[..]
+        }
+        None => speech_segments,
+    };
 
     let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
     for segment in speech_segments {
@@ -480,8 +524,14 @@ pub(crate) async fn run_batch_transcription(
             // computed BEFORE the push so the diarizer history records the
             // same id the saved row will carry.
             let sequence_id = all_transcripts.len() as u64;
+            // The batch input is one mixed track, so there's no source.
+            let info = SegmentInfo {
+                start_secs: segment.start_timestamp_ms / 1000.0,
+                end_secs: segment.end_timestamp_ms / 1000.0,
+                source: None,
+            };
             let (speaker, voice_profile_id) = match diarizer.as_ref() {
-                Some(d) => match d.process(sequence_id, &segment.samples, None) {
+                Some(d) => match d.process(sequence_id, &segment.samples, None, info) {
                     Ok(result) => (Some(result.label), result.voice_profile_id),
                     Err(e) => {
                         debug!("Diarization fallback for batch segment {}: {}", i, e);
@@ -525,7 +575,75 @@ pub(crate) async fn run_batch_transcription(
         return Err(anyhow!("Cancelled"));
     }
 
+    if let Some(d) = diarizer.as_ref() {
+        refine_batch_speakers(d, &mut all_transcripts, offline_turns);
+    }
+
     Ok(all_transcripts)
+}
+
+/// Replace the streaming labels with whole-batch ones: offline turns when
+/// available, else HAC over the collected embeddings. The diarizer's history
+/// is updated too so a later promote/merge finds the labels the user sees.
+fn refine_batch_speakers(
+    diarizer: &Diarizer,
+    transcripts: &mut [BatchTranscript],
+    offline_turns: Option<&[OfflineTurn]>,
+) {
+    let refined = diarizer.refine_with_turns(offline_turns);
+    let changed = refined.iter().filter(|r| r.changed).count();
+    let by_sequence: std::collections::HashMap<u64, _> =
+        refined.iter().map(|r| (r.sequence_id, r)).collect();
+    for t in transcripts.iter_mut() {
+        if let Some(r) = by_sequence.get(&t.sequence_id) {
+            t.speaker = Some(r.speaker.clone());
+            t.voice_profile_id = r.voice_profile_id.clone();
+        }
+    }
+    diarizer.apply_refinement(&refined);
+    info!(
+        "Batch speaker refinement ({}): {} of {} segments relabeled",
+        if offline_turns.is_some() { "offline turns" } else { "HAC" },
+        changed,
+        refined.len()
+    );
+}
+
+/// Cut `segment` at the offline speaker-change points inside it. Pieces
+/// shorter than [`MIN_TURN_RUN_SECS`] can't occur (the change-point search
+/// absorbs them), so every piece is long enough to embed.
+fn split_segment_at_turns(
+    segment: &crate::audio::vad::SpeechSegment,
+    turns: &[OfflineTurn],
+) -> Vec<crate::audio::vad::SpeechSegment> {
+    let start_s = segment.start_timestamp_ms / 1000.0;
+    let end_s = segment.end_timestamp_ms / 1000.0;
+    let points = speaker_change_points(turns, start_s, end_s, MIN_TURN_RUN_SECS);
+    if points.is_empty() || segment.samples.is_empty() {
+        return vec![segment.clone()];
+    }
+
+    let total = segment.samples.len();
+    let secs_per_sample = (end_s - start_s) / total as f64;
+    let mut bounds: Vec<usize> = points
+        .iter()
+        .map(|p| (((p - start_s) / secs_per_sample).round() as usize).min(total))
+        .collect();
+    bounds.insert(0, 0);
+    bounds.push(total);
+    bounds.dedup();
+
+    bounds
+        .windows(2)
+        .filter(|w| w[1] > w[0])
+        .map(|w| crate::audio::vad::SpeechSegment {
+            samples: segment.samples[w[0]..w[1]].to_vec(),
+            start_timestamp_ms: (start_s + w[0] as f64 * secs_per_sample) * 1000.0,
+            end_timestamp_ms: (start_s + w[1] as f64 * secs_per_sample) * 1000.0,
+            confidence: segment.confidence,
+            source: segment.source.clone(),
+        })
+        .collect()
 }
 
 /// Split a long speech segment at the lowest-energy (silence) point near the target size.

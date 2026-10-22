@@ -408,7 +408,14 @@ async fn process_chunk<R: Runtime>(
             // async runtime so it can't stall other tasks (same reasoning
             // as whisper inference).
             let samples = diarization_samples.unwrap_or_default();
-            tokio::task::spawn_blocking(move || diarizer.process(sequence_id, &samples, embedding))
+            let info = crate::speaker_diarization::SegmentInfo {
+                start_secs: audio_start_time,
+                end_secs: audio_end_time,
+                source: Some(chunk_source),
+            };
+            tokio::task::spawn_blocking(move || {
+                diarizer.process(sequence_id, &samples, embedding, info)
+            })
                 .await
                 .ok()
                 .and_then(|res| match res {

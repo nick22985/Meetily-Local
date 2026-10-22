@@ -355,6 +355,15 @@ async fn audit_models_at_startup<R: Runtime>(app: &AppHandle<R>) {
         }
         None => log::warn!("[startup-audit] speaker:  models directory not configured"),
     }
+    if let Some(path) = speaker_diarization::model::segmentation_model_path() {
+        let ready = speaker_diarization::model::model_is_ready(&path);
+        log::info!(
+            "[startup-audit] segment:  {:<28} status={} path={}",
+            speaker_diarization::model::SEGMENTATION_MODEL_FILENAME,
+            if ready { "PRESENT" } else { "MISSING" },
+            path.display()
+        );
+    }
 
     // ── VAD (silero via sherpa-onnx) ──────────────────────────────────────
     match speaker_diarization::model::silero_vad_path() {
@@ -400,12 +409,14 @@ async fn audit_models_at_startup<R: Runtime>(app: &AppHandle<R>) {
 /// fetches:
 /// - `silero_vad.onnx` — required for VAD (the audio pipeline can't function
 ///   without it; this is the model sherpa-onnx's `VoiceActivityDetector` uses).
-/// - The speaker diarization model — required for "Speaker N" attribution
-///   on system audio; without it, system transcripts fall back to the
-///   "Speaker" placeholder.
+/// - The active speaker embedding model — required for "Speaker N"
+///   attribution on system audio; without it, system transcripts fall back
+///   to the "Speaker" placeholder.
+/// - The pyannote segmentation model (~6MB) — used by the offline pass
+///   after each recording; without it refinement falls back to HAC.
 ///
-/// Both are tiny (~2.3MB + ~28MB). Non-fatal: a failed download just leaves
-/// the corresponding feature degraded.
+/// Non-fatal: a failed download just leaves the corresponding feature
+/// degraded.
 async fn ensure_required_models_downloaded<R: Runtime>(app: &AppHandle<R>) {
     // ── silero VAD ──
     if let Some(silero_path) = speaker_diarization::model::silero_vad_path() {
@@ -437,28 +448,28 @@ async fn ensure_required_models_downloaded<R: Runtime>(app: &AppHandle<R>) {
         return;
     };
 
-    if speaker_diarization::model::model_is_ready(&speaker_path) {
+    let missing = speaker_diarization::commands::missing_speaker_models().unwrap_or_default();
+    if missing.is_empty() {
         log::debug!(
-            "[startup-download] speaker model already present at {}",
+            "[startup-download] speaker models already present at {}",
             speaker_path.display()
         );
     } else {
-        log::info!(
-            "[startup-download] speaker model missing — fetching {} (~28MB, one-time)",
-            speaker_diarization::model_filename()
-        );
+        for (url, path) in &missing {
+            log::info!(
+                "[startup-download] speaker model missing — fetching {} → {} (one-time)",
+                url,
+                path.display()
+            );
+        }
         match speaker_diarization::commands::speaker_model_download(app.clone()).await {
-            Ok(()) => log::info!(
-                "[startup-download] speaker model downloaded → {}",
-                speaker_path.display()
-            ),
+            Ok(()) => log::info!("[startup-download] speaker models downloaded"),
             Err(e) => {
-                log::warn!(
-                    "[startup-download] speaker model download failed: {} \
-                     (speaker N attribution disabled)",
-                    e
-                );
-                return;
+                log::warn!("[startup-download] speaker model download failed: {}", e);
+                if !speaker_diarization::model::model_is_ready(&speaker_path) {
+                    log::warn!("[startup-download] speaker N attribution disabled");
+                    return;
+                }
             }
         }
     }
@@ -572,26 +583,6 @@ pub fn run() {
             // so the speaker model can be downloaded independently).
             speaker_diarization::model::set_models_dir(&_app.handle());
 
-            // Pre-warm the speaker diarizer at startup (if model is on disk)
-            // so the first recording / retranscription doesn't pay the model
-            // load latency. Async + non-blocking. Stores in the global slot;
-            // recording start replaces it with a fresh instance to reset
-            // cluster IDs per session.
-            let app_handle_for_diarizer = _app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                match speaker_diarization::commands::build_diarizer(&app_handle_for_diarizer).await
-                {
-                    Ok(Some(diarizer)) => {
-                        speaker_diarization::set_current_diarizer(Some(diarizer));
-                        log::info!("✅ Speaker diarizer pre-initialized at startup");
-                    }
-                    Ok(None) => log::info!(
-                        "Speaker diarizer pre-init skipped (model not downloaded yet)"
-                    ),
-                    Err(e) => log::warn!("Speaker diarizer pre-init failed: {}", e),
-                }
-            });
-
             // Initialize ModelManager for summary engine (async, non-blocking)
             let app_handle_for_model_manager = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -621,25 +612,35 @@ pub fn run() {
                 audit_models_at_startup(&app_handle_for_audit).await;
             });
 
-            // Auto-download missing built-in models. Only the speaker diarization
-            // model is fetched here today — Whisper is user-selectable so we leave
-            // it to onboarding / settings, and summary models are picked by the
-            // existing built-in AI flow. The speaker model is small (~28MB) and
-            // diarization won't work without it, so silent background fetch is
-            // the right UX. Failures are non-fatal (the diarizer just stays
-            // disabled and labels fall back to the "Speaker" placeholder).
+            // Initialize database (handles first launch detection and conditional setup)
+            tauri::async_runtime::block_on(async {
+                database::setup::initialize_database_on_startup(&_app.handle()).await
+            })
+            .expect("Failed to initialize database");
+
+            // Select the saved speaker embedding model before anything
+            // resolves a speaker model path. Needs the database (above) and
+            // the speaker models dir.
+            tauri::async_runtime::block_on(speaker_diarization::settings::initialize(
+                &_app.handle(),
+            ));
+
+            // Auto-download missing built-in models: VAD and the speaker
+            // models. Whisper is user-selectable so we leave it to onboarding
+            // / settings, and summary models are picked by the existing
+            // built-in AI flow. The speaker models are small and diarization
+            // won't work without them, so silent background fetch is the
+            // right UX. Once they're present this also pre-warms the
+            // diarizer, so the first recording / retranscription doesn't pay
+            // the model load latency. Failures are non-fatal (the diarizer
+            // just stays disabled and labels fall back to the "Speaker"
+            // placeholder).
             let app_handle_for_dl = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Run after the audit so its log block stays unbroken.
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 ensure_required_models_downloaded(&app_handle_for_dl).await;
             });
-
-            // Initialize database (handles first launch detection and conditional setup)
-            tauri::async_runtime::block_on(async {
-                database::setup::initialize_database_on_startup(&_app.handle()).await
-            })
-            .expect("Failed to initialize database");
 
             // Initialize notification system now that the database is ready.
             // (Consent lookup + settings persistence both need the DB pool; the
@@ -742,6 +743,9 @@ pub fn run() {
             // Speaker diarization commands
             speaker_diarization::commands::speaker_model_status,
             speaker_diarization::commands::speaker_model_download,
+            speaker_diarization::settings::api_get_speaker_diarization_settings,
+            speaker_diarization::settings::api_set_speaker_diarization_settings,
+            speaker_diarization::settings::api_list_speaker_embedding_models,
             speaker_diarization::commands::list_voice_profiles,
             speaker_diarization::commands::delete_voice_profile,
             speaker_diarization::commands::update_voice_profile,

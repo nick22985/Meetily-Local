@@ -9,6 +9,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
@@ -398,6 +399,9 @@ async fn run_import<R: Runtime>(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
     );
+    // Shared between VAD and the offline speaker pass below.
+    let audio_samples = Arc::new(audio_samples);
+    let samples_for_vad = audio_samples.clone();
 
     emit_progress(&app, "vad", 25, "Detecting speech segments...");
 
@@ -412,7 +416,7 @@ async fn run_import<R: Runtime>(
 
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
-            &audio_samples,
+            &samples_for_vad,
             VAD_REDEMPTION_TIME_MS,
             |vad_progress, segments_found| {
                 let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
@@ -503,6 +507,16 @@ async fn run_import<R: Runtime>(
         info!("Speaker diarization enabled for import");
     }
 
+    // Whole-file speaker turns: split segments at speaker changes and
+    // regroup labels once transcription is done. None (HAC fallback) when
+    // the segmentation model isn't downloaded.
+    let offline_turns = if diarizer.is_some() {
+        emit_progress(&app, "diarizing", 30, "Identifying speakers...");
+        super::common::offline_turns(audio_samples).await
+    } else {
+        None
+    };
+
     // Split-at-silence -> per-segment transcribe -> diarize is shared with
     // retranscription (see `common::run_batch_transcription`); only the
     // progress-event shape/percentage range differs here.
@@ -516,6 +530,7 @@ async fn run_import<R: Runtime>(
             language.clone(),
             engine,
             diarizer.clone(),
+            offline_turns.as_deref(),
             &IMPORT_CANCELLED,
             move |i, total, segment_duration_sec| {
                 let progress = 30 + ((i as f32 / total.max(1) as f32) * 50.0) as u32;

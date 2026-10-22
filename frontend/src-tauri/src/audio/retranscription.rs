@@ -10,6 +10,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Global flag to track if retranscription is in progress
@@ -147,7 +148,7 @@ pub async fn start_retranscription<R: Runtime>(
 
 /// Find audio file in meeting folder
 /// Tries common names first, then scans for any file with an audio extension
-fn find_audio_file(folder: &Path) -> Result<PathBuf> {
+pub(crate) fn find_audio_file(folder: &Path) -> Result<PathBuf> {
     let candidates = [
         "audio.mp4",
         "audio.m4a",
@@ -254,6 +255,9 @@ async fn run_retranscription<R: Runtime>(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
     );
+    // Shared between VAD and the offline speaker pass below.
+    let audio_samples = Arc::new(audio_samples);
+    let samples_for_vad = audio_samples.clone();
 
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
@@ -270,7 +274,7 @@ async fn run_retranscription<R: Runtime>(
 
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
-            &audio_samples,
+            &samples_for_vad,
             VAD_REDEMPTION_TIME_MS,
             |vad_progress, segments_found| {
                 // Map VAD progress (0-100) to overall progress (20-25)
@@ -346,6 +350,16 @@ async fn run_retranscription<R: Runtime>(
         info!("Speaker diarization unavailable — transcripts will have no speaker labels");
     }
 
+    // Whole-file speaker turns: split segments at speaker changes and
+    // regroup labels once transcription is done. None (HAC fallback) when
+    // the segmentation model isn't downloaded.
+    let offline_turns = if diarizer.is_some() {
+        emit_progress(&app, &meeting_id, "diarizing", 25, "Identifying speakers...");
+        super::common::offline_turns(audio_samples).await
+    } else {
+        None
+    };
+
     // Split-at-silence -> per-segment transcribe -> diarize is shared with
     // audio import (see `common::run_batch_transcription`); only the
     // progress-event shape/percentage range differs here.
@@ -356,6 +370,7 @@ async fn run_retranscription<R: Runtime>(
         language.clone(),
         transcription_engine,
         diarizer.clone(),
+        offline_turns.as_deref(),
         &RETRANSCRIPTION_CANCELLED,
         move |i, total, segment_duration_sec| {
             // Calculate progress (25% to 80% range for transcription)

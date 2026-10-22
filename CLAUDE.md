@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Root-level scripts (recommended — handle CUDA/Vulkan env setup and the `llama-helper` sidecar build for you):
 
 ```bash
-./dev.sh                    # auto: full Tauri dev, CUDA on NVIDIA, CPU otherwise
+./dev.sh                    # auto: full Tauri dev, CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise
 ./dev.sh cuda                # NVIDIA CUDA
 ./dev.sh vulkan               # AMD/Intel Vulkan
 ./dev.sh cpu                  # CPU-only

@@ -1,8 +1,9 @@
 //! Speaker diarization layer.
 //!
 //! Sits behind the dual-VAD audio pipeline (see `audio::pipeline`): when a
-//! speech segment is about to be transcribed, we extract a 512-dim CAM++
-//! speaker embedding and assign it to a cluster (online, real-time) so the
+//! speech segment is about to be transcribed, we extract a speaker embedding
+//! (192-dim with the default 3D-Speaker CAM++ model; the model is selectable,
+//! see [`model::EMBEDDING_MODELS`]) and assign it to a cluster (online, real-time) so the
 //! transcription gets tagged with "Speaker 1", "Speaker 2", etc.
 //!
 //! Both mic AND system segments run through this layer when a diarizer is
@@ -36,10 +37,14 @@
 //!   recording session and is dropped on stop, resetting cluster IDs.
 //! - The transcription worker reads [`DIARIZER`] via [`current_diarizer`] and
 //!   calls [`Diarizer::process`] for each chunk.
-//! - When recording stops, [`Diarizer::refine`] re-clusters the whole
-//!   session offline and [`Diarizer::apply_refinement`] writes the improved
-//!   labels back into the history, keeping it consistent with what the DB
-//!   and UI show (promote/merge look embeddings up *by label*).
+//! - When recording stops, the recorded audio is run through a full offline
+//!   diarization ([`offline`]: pyannote segmentation + embedding clustering)
+//!   and [`Diarizer::refine_with_turns`] re-groups the session by its speaker
+//!   turns — or, when the segmentation model or audio is unavailable,
+//!   re-clusters the live embeddings with HAC. [`Diarizer::apply_refinement`]
+//!   then writes the improved labels back into the history, keeping it
+//!   consistent with what the DB and UI show (promote/merge look embeddings
+//!   up *by label*).
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -49,17 +54,25 @@ pub(crate) mod clusterer;
 mod embedder;
 pub(crate) mod embedding_math;
 pub mod enrollment;
+pub mod der;
 pub mod model;
+pub mod offline;
 mod profile_matcher;
 mod refinement;
+pub mod settings;
 
 pub mod commands;
 
 pub use clusterer::OnlineSpeakerClusterer;
 pub use embedder::SpeakerEmbedder;
 pub use model::{default_model_path, model_download_url, model_filename, models_dir};
-pub use profile_matcher::{ProfileMatch, SpeakerProfileMatcher};
-pub use refinement::RefinedAssignment;
+pub use profile_matcher::{
+    prune_exemplars, ProfileMatch, SpeakerProfileMatcher, StoredProfile, MAX_EXEMPLARS,
+};
+pub use offline::OfflineTurn;
+pub use refinement::{RefineOptions, RefinedAssignment};
+
+use crate::audio::recording_state::DeviceType;
 
 use anyhow::Result;
 
@@ -128,6 +141,46 @@ pub struct DiarizationResult {
     pub voice_profile_id: Option<String>,
 }
 
+/// Where a segment sits in the recording and which capture source it came
+/// from. Timing feeds duration weighting and the offline-turn mapping in
+/// refinement; `source` feeds the optional mic/system cannot-link.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentInfo {
+    /// Seconds from recording start (aligned with the saved audio file).
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub source: Option<DeviceType>,
+}
+
+impl SegmentInfo {
+    pub fn duration_secs(&self) -> f32 {
+        (self.end_secs - self.start_secs).max(0.0) as f32
+    }
+}
+
+/// Session-level diarizer knobs, from [`settings::SpeakerDiarizationSettings`].
+#[derive(Debug, Clone, Copy)]
+pub struct DiarizerOptions {
+    /// Online clustering cutoff ([`DEFAULT_CLUSTER_THRESHOLD`]).
+    pub cluster_threshold: f32,
+    /// HAC cutoff for refinement ([`REFINE_CLUSTER_THRESHOLD`]).
+    pub refine_threshold: f32,
+    /// Keep mic and system voices in separate clusters. Right for headphone
+    /// setups (the mic only ever hears the local side); wrong when the mic
+    /// picks up the room's speakers.
+    pub separate_sources: bool,
+}
+
+impl Default for DiarizerOptions {
+    fn default() -> Self {
+        Self {
+            cluster_threshold: DEFAULT_CLUSTER_THRESHOLD,
+            refine_threshold: REFINE_CLUSTER_THRESHOLD,
+            separate_sources: false,
+        }
+    }
+}
+
 /// One speaker-turn sub-range `[start, end)` (in samples) of a VAD segment,
 /// as detected by [`Diarizer::speaker_turns`]. Carries the L2-normalized
 /// average of the range's analysis-window embeddings when at least one
@@ -149,6 +202,10 @@ pub struct Diarizer {
     profile_matcher: Option<Arc<SpeakerProfileMatcher>>,
     clusterer: Mutex<OnlineSpeakerClusterer>,
     history: Mutex<Vec<EmbeddingRecord>>,
+    options: DiarizerOptions,
+    /// Filename of the embedding model `embedder` was loaded from. Stored
+    /// profiles are only comparable with embeddings from the same model.
+    embedding_model: String,
 }
 
 /// One diarized segment in the session history. `label`/`voice_profile_id`
@@ -164,20 +221,47 @@ pub struct EmbeddingRecord {
     pub embedding: Vec<f32>,
     pub voice_profile_id: Option<String>,
     pub label: String,
+    /// Segment position in the recording, when the caller knew it.
+    pub start_secs: Option<f64>,
+    pub end_secs: Option<f64>,
+    pub source: Option<DeviceType>,
+}
+
+impl EmbeddingRecord {
+    pub fn duration_secs(&self) -> Option<f32> {
+        match (self.start_secs, self.end_secs) {
+            (Some(s), Some(e)) => Some((e - s).max(0.0) as f32),
+            _ => None,
+        }
+    }
 }
 
 impl Diarizer {
     pub fn new(
         embedder: Arc<SpeakerEmbedder>,
-        threshold: f32,
+        embedding_model: String,
+        options: DiarizerOptions,
         profile_matcher: Option<Arc<SpeakerProfileMatcher>>,
     ) -> Self {
         Self {
             embedder,
             profile_matcher,
-            clusterer: Mutex::new(OnlineSpeakerClusterer::new(threshold)),
+            clusterer: Mutex::new(OnlineSpeakerClusterer::new(
+                options.cluster_threshold,
+                options.separate_sources,
+            )),
             history: Mutex::new(Vec::new()),
+            options,
+            embedding_model,
         }
+    }
+
+    pub fn embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
+    pub fn options(&self) -> DiarizerOptions {
+        self.options
     }
 
     /// Diarize one speech segment: try to match a stored profile, fall back
@@ -190,12 +274,18 @@ impl Diarizer {
     /// When `None` (segment too short for turn analysis, or a batch caller),
     /// `samples_16k` is embedded directly.
     ///
+    /// `info` places the segment in the recording: its duration weights the
+    /// clusterer update (and keeps sub-[`clusterer::MIN_SEED_SECS`] segments
+    /// from seeding clusters), its source drives the optional mic/system
+    /// separation.
+    ///
     /// [`speaker_turns`]: Diarizer::speaker_turns
     pub fn process(
         &self,
         sequence_id: u64,
         samples_16k: &[f32],
         precomputed: Option<Vec<f32>>,
+        info: SegmentInfo,
     ) -> Result<DiarizationResult> {
         let mut embedding = match precomputed {
             Some(e) => e,
@@ -213,7 +303,7 @@ impl Diarizer {
                 .clusterer
                 .lock()
                 .map_err(|_| anyhow::anyhow!("speaker clusterer mutex poisoned"))?;
-            let cluster_id = clusterer.assign(embedding.clone());
+            let cluster_id = clusterer.assign(embedding.clone(), info.duration_secs(), info.source);
             clusterer.label_for(cluster_id)
         };
 
@@ -236,6 +326,9 @@ impl Diarizer {
                 embedding,
                 voice_profile_id: voice_profile_id.clone(),
                 label: label.clone(),
+                start_secs: Some(info.start_secs),
+                end_secs: Some(info.end_secs),
+                source: info.source,
             });
         }
 
@@ -314,27 +407,52 @@ impl Diarizer {
     ///
     /// [`apply_refinement`]: Diarizer::apply_refinement
     pub fn embeddings_for_label(&self, label: &str) -> Vec<Vec<f32>> {
+        self.weighted_embeddings_for_label(label)
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect()
+    }
+
+    /// Like [`embeddings_for_label`], paired with each segment's duration in
+    /// seconds (1.0 when unknown) for duration-weighted centroids.
+    ///
+    /// [`embeddings_for_label`]: Diarizer::embeddings_for_label
+    pub fn weighted_embeddings_for_label(&self, label: &str) -> Vec<(Vec<f32>, f32)> {
         self.history
             .lock()
             .map(|h| {
                 h.iter()
                     .filter(|r| r.label == label)
-                    .map(|r| r.embedding.clone())
+                    .map(|r| (r.embedding.clone(), r.duration_secs().unwrap_or(1.0)))
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Re-cluster the whole session offline (see [`refinement`]), consulting
-    /// stored voice profiles so near-threshold segments of an enrolled voice
-    /// fold into the profile instead of surfacing as a parallel "Speaker N".
+    /// Re-cluster the whole session offline with HAC (see [`refinement`]),
+    /// consulting stored voice profiles so near-threshold segments of an
+    /// enrolled voice fold into the profile instead of surfacing as a
+    /// parallel "Speaker N".
     pub fn refine(&self) -> Vec<RefinedAssignment> {
+        self.refine_with_turns(None)
+    }
+
+    /// Re-group the session by offline-diarization `turns` (timestamps in
+    /// seconds on the same clock as [`SegmentInfo`]) when given, else fall
+    /// back to HAC over the live embeddings.
+    pub fn refine_with_turns(&self, turns: Option<&[OfflineTurn]>) -> Vec<RefinedAssignment> {
         let history = self.export_history();
-        refinement::refine(
-            &history,
-            REFINE_CLUSTER_THRESHOLD,
-            self.profile_matcher.as_deref(),
-        )
+        let options = RefineOptions {
+            threshold: self.options.refine_threshold,
+            separate_sources: self.options.separate_sources,
+        };
+        let matcher = self.profile_matcher.as_deref();
+        match turns {
+            Some(turns) if !turns.is_empty() => {
+                refinement::refine_with_offline_turns(&history, turns, &options, matcher)
+            }
+            _ => refinement::refine(&history, &options, matcher),
+        }
     }
 
     /// Write refined labels back into the session history so subsequent

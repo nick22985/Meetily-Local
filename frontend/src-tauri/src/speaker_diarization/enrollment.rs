@@ -324,6 +324,7 @@ pub async fn finish_self_voice_enrollment<R: Runtime>(
         &label,
         &centroid,
         window_count as i64,
+        &crate::speaker_diarization::model_filename(),
     )
     .await
     .map_err(|e| format!("Failed to save your voice profile: {}", e))?;

@@ -2,16 +2,22 @@
 
 use crate::database::repositories::transcript::TranscriptsRepository;
 use crate::database::repositories::voice_profile::{bytes_to_floats, VoiceProfilesRepository};
-use crate::speaker_diarization::embedding_math::{average_and_normalize, merge_centroids};
+use crate::speaker_diarization::embedding_math::{merge_centroids, weighted_average_and_normalize};
+use crate::speaker_diarization::model::{
+    model_is_ready, segmentation_model_path, segmentation_model_url,
+};
 use crate::speaker_diarization::{
-    current_diarizer, default_model_path, model::model_is_ready, model_download_url,
-    model_filename, set_current_diarizer, Diarizer, SpeakerEmbedder, SpeakerProfileMatcher,
-    DEFAULT_CLUSTER_THRESHOLD, PROFILE_MATCH_THRESHOLD,
+    current_diarizer, default_model_path, model_download_url, model_filename, offline,
+    prune_exemplars, set_current_diarizer, settings, Diarizer, DiarizerOptions, SpeakerEmbedder,
+    SpeakerProfileMatcher, StoredProfile, MAX_EXEMPLARS, PROFILE_MATCH_THRESHOLD,
 };
 use crate::state::AppState;
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{command, AppHandle, Emitter, Manager, Runtime};
 use tokio::io::AsyncWriteExt;
@@ -22,6 +28,10 @@ pub struct SpeakerModelStatus {
     pub model_path: Option<String>,
     pub is_ready: bool,
     pub download_url: String,
+    /// Whether the pyannote segmentation model used by the post-recording
+    /// offline pass is on disk. Diarization works without it (refinement
+    /// falls back to HAC), just less accurately.
+    pub segmentation_ready: bool,
 }
 
 /// Returns whether the speaker model file exists on disk along with its
@@ -32,23 +42,23 @@ pub async fn speaker_model_status() -> Result<SpeakerModelStatus, String> {
     let path = default_model_path();
     let is_ready = path.as_deref().map(model_is_ready).unwrap_or(false);
     Ok(SpeakerModelStatus {
-        model_filename: model_filename().to_string(),
+        model_filename: model_filename(),
         model_path: path.map(|p| p.to_string_lossy().into_owned()),
         is_ready,
         download_url: model_download_url(),
+        segmentation_ready: segmentation_model_path().map_or(false, |p| model_is_ready(&p)),
     })
 }
 
-/// Download the speaker model. Emits `speaker-model-download-progress`
-/// (`{ progress: 0..100 }`) while running, then `speaker-model-download-complete`
-/// or `speaker-model-download-error` at the end. Idempotent: if the file is
-/// already present and non-empty, returns immediately.
+/// Download the active speaker embedding model and the segmentation model,
+/// whichever are missing. Emits `speaker-model-download-progress`
+/// (`{ progress: 0..100 }`, across both files) while running, then
+/// `speaker-model-download-complete` or `speaker-model-download-error` at the
+/// end. Idempotent: if both files are already present, returns immediately.
 #[command]
 pub async fn speaker_model_download<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    let path = default_model_path()
-        .ok_or_else(|| "Speaker models directory not initialized".to_string())?;
-
-    if model_is_ready(&path) {
+    let missing = missing_speaker_models()?;
+    if missing.is_empty() {
         let _ = app.emit(
             "speaker-model-download-complete",
             serde_json::json!({ "alreadyPresent": true }),
@@ -56,17 +66,7 @@ pub async fn speaker_model_download<R: Runtime>(app: AppHandle<R>) -> Result<(),
         return Ok(());
     }
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("Failed to create speaker models dir: {}", e));
-        }
-    }
-
-    let url = model_download_url();
-    log::info!("Downloading speaker model from {} -> {}", url, path.display());
-
-    if let Err(e) = stream_download(&app, &url, &path).await {
-        let _ = std::fs::remove_file(&path); // partial-file cleanup
+    if let Err(e) = download_speaker_models(&app, &missing).await {
         let msg = e.to_string();
         let _ = app.emit(
             "speaker-model-download-error",
@@ -79,6 +79,45 @@ pub async fn speaker_model_download<R: Runtime>(app: AppHandle<R>) -> Result<(),
         "speaker-model-download-complete",
         serde_json::json!({ "alreadyPresent": false }),
     );
+    Ok(())
+}
+
+/// `(url, destination)` for each speaker model not yet on disk: the active
+/// embedding model, then the segmentation model.
+pub fn missing_speaker_models() -> Result<Vec<(String, PathBuf)>, String> {
+    let embedding = default_model_path()
+        .ok_or_else(|| "Speaker models directory not initialized".to_string())?;
+    let segmentation = segmentation_model_path()
+        .ok_or_else(|| "Speaker models directory not initialized".to_string())?;
+    Ok([
+        (model_download_url(), embedding),
+        (segmentation_model_url().to_string(), segmentation),
+    ]
+    .into_iter()
+    .filter(|(_, path)| !model_is_ready(path))
+    .collect())
+}
+
+/// Download `models` in order, reporting progress over the whole batch. A
+/// failed file is removed so a partial download is never mistaken for a
+/// ready model.
+pub async fn download_speaker_models<R: Runtime>(
+    app: &AppHandle<R>,
+    models: &[(String, PathBuf)],
+) -> Result<()> {
+    let n = models.len().max(1) as u32;
+    for (i, (url, path)) in models.iter().enumerate() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("Failed to create speaker models dir: {}", e))?;
+        }
+        log::info!("Downloading speaker model from {} -> {}", url, path.display());
+        let range = ((i as u32 * 100 / n) as u8, ((i as u32 + 1) * 100 / n) as u8);
+        if let Err(e) = stream_download(app, url, path, range).await {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -102,13 +141,13 @@ pub async fn build_diarizer<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Arc
         return Ok(None);
     }
 
+    let embedding_model = model_filename();
     let embedder = SpeakerEmbedder::from_path(&path, 1)?;
     let dim = embedder.dim();
 
-    // Load all stored voice profiles whose embedding dim matches the model.
-    // A mismatched-dim profile (e.g., from an older model) is skipped by the
-    // matcher rather than failing the build.
-    let matcher = match build_profile_matcher(app, dim).await {
+    // Load the stored voice profiles built with this model. Profiles from
+    // another model live in an unrelated embedding space and are left out.
+    let matcher = match build_profile_matcher(app, dim, &embedding_model).await {
         Ok(m) => m,
         Err(e) => {
             log::warn!("Failed to load voice profiles: {} (continuing without)", e);
@@ -116,7 +155,11 @@ pub async fn build_diarizer<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Arc
         }
     };
 
-    let diarizer = Diarizer::new(Arc::new(embedder), DEFAULT_CLUSTER_THRESHOLD, matcher);
+    let options = DiarizerOptions {
+        separate_sources: settings::separate_sources(),
+        ..DiarizerOptions::default()
+    };
+    let diarizer = Diarizer::new(Arc::new(embedder), embedding_model, options, matcher);
     Ok(Some(Arc::new(diarizer)))
 }
 
@@ -147,6 +190,7 @@ pub fn shutdown_for_recording() {
 async fn build_profile_matcher<R: Runtime>(
     app: &AppHandle<R>,
     dim: usize,
+    embedding_model: &str,
 ) -> Result<Option<Arc<SpeakerProfileMatcher>>> {
     let state = app
         .try_state::<AppState>()
@@ -157,15 +201,45 @@ async fn build_profile_matcher<R: Runtime>(
         .await
         .map_err(|e| anyhow!("DB error listing voice profiles: {}", e))?;
 
+    let skipped = profiles
+        .iter()
+        .filter(|p| p.embedding_model != embedding_model)
+        .count();
+    if skipped > 0 {
+        log::info!(
+            "{} voice profile(s) were built with another embedding model and won't be matched",
+            skipped
+        );
+    }
+    let profiles: Vec<_> = profiles
+        .into_iter()
+        .filter(|p| p.embedding_model == embedding_model)
+        .collect();
     if profiles.is_empty() {
         return Ok(None);
     }
 
+    let mut exemplars: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    for e in VoiceProfilesRepository::list_exemplars_for_model(pool, embedding_model)
+        .await
+        .map_err(|e| anyhow!("DB error listing voice profile exemplars: {}", e))?
+    {
+        if let Some(v) = bytes_to_floats(&e.embedding) {
+            exemplars.entry(e.profile_id).or_default().push(v);
+        }
+    }
+
     let entries = profiles.into_iter().filter_map(|p| {
-        bytes_to_floats(&p.embedding).map(|emb| (p.id, p.name, emb))
+        let centroid = bytes_to_floats(&p.embedding)?;
+        Some(StoredProfile {
+            exemplars: exemplars.remove(&p.id).unwrap_or_default(),
+            id: p.id,
+            name: p.name,
+            centroid,
+        })
     });
 
-    let matcher = SpeakerProfileMatcher::new(dim, entries, PROFILE_MATCH_THRESHOLD)?;
+    let matcher = SpeakerProfileMatcher::new(dim, entries, PROFILE_MATCH_THRESHOLD);
     if matcher.num_profiles() == 0 {
         Ok(None)
     } else {
@@ -173,10 +247,12 @@ async fn build_profile_matcher<R: Runtime>(
     }
 }
 
+/// Stream `url` to `dest`, emitting progress mapped into `range` (percent).
 async fn stream_download<R: Runtime>(
     app: &AppHandle<R>,
     url: &str,
-    dest: &std::path::Path,
+    dest: &Path,
+    range: (u8, u8),
 ) -> Result<()> {
     let response = reqwest::get(url)
         .await
@@ -202,7 +278,8 @@ async fn stream_download<R: Runtime>(
         downloaded += chunk.len() as u64;
 
         if total > 0 {
-            let pct = ((downloaded as u128 * 100) / total as u128) as u8;
+            let span = (range.1 - range.0) as u128;
+            let pct = range.0 + ((downloaded as u128 * span) / total as u128) as u8;
             // Emit only on 1% steps to avoid event flood for a 28MB download.
             if pct != last_pct {
                 last_pct = pct;
@@ -233,6 +310,9 @@ pub struct VoiceProfileDto {
     pub email: Option<String>,
     pub embedding_dim: i64,
     pub sample_count: i64,
+    /// Embedding model the profile was built with. Profiles from a model
+    /// other than the active one aren't matched until re-recorded/re-named.
+    pub embedding_model: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -290,6 +370,7 @@ pub async fn list_voice_profiles<R: Runtime>(
             email: p.email,
             embedding_dim: p.embedding_dim,
             sample_count: p.sample_count,
+            embedding_model: p.embedding_model,
             created_at: p.created_at,
             updated_at: p.updated_at,
         })
@@ -375,8 +456,10 @@ pub async fn promote_speaker_to_profile<R: Runtime>(
     // that produced this meeting is still the in-memory singleton (a live
     // recording or its just-finished retranscription). Older meetings
     // degrade to rename-only.
-    let embeddings = current_diarizer()
-        .map(|d| d.embeddings_for_label(&old_label))
+    let diarizer = current_diarizer();
+    let embeddings = diarizer
+        .as_ref()
+        .map(|d| d.weighted_embeddings_for_label(&old_label))
         .unwrap_or_default();
 
     let profile_id = if embeddings.is_empty() {
@@ -387,13 +470,18 @@ pub async fn promote_speaker_to_profile<R: Runtime>(
         );
         None
     } else {
-        let centroid = average_and_normalize(&embeddings);
+        let centroid = weighted_centroid(&embeddings);
+        let embedding_model = diarizer
+            .as_ref()
+            .map(|d| d.embedding_model().to_string())
+            .unwrap_or_else(model_filename);
         let id = VoiceProfilesRepository::create(
             pool,
             trimmed_name,
             normalised_email,
             &centroid,
             embeddings.len() as i64,
+            &embedding_model,
         )
         .await
         .map_err(|e| format!("Failed to create voice profile: {}", e))?;
@@ -494,7 +582,9 @@ pub async fn merge_voice_profiles<R: Runtime>(
         .map_err(|e| format!("Failed to load loser profile: {}", e))?
         .ok_or_else(|| format!("Profile not found: {}", args.loser_id))?;
 
-    let centroid_updated = if winner.embedding_dim == loser.embedding_dim {
+    let same_space = winner.embedding_dim == loser.embedding_dim
+        && winner.embedding_model == loser.embedding_model;
+    let centroid_updated = if same_space {
         let winner_centroid = bytes_to_floats(&winner.embedding)
             .ok_or_else(|| "Winner profile has corrupt embedding".to_string())?;
         let loser_centroid = bytes_to_floats(&loser.embedding)
@@ -509,11 +599,23 @@ pub async fn merge_voice_profiles<R: Runtime>(
         VoiceProfilesRepository::update_centroid(pool, &winner.id, &merged, new_count)
             .await
             .map_err(|e| format!("Failed to update winner centroid: {}", e))?;
+
+        // The loser's exemplars, plus its centroid, carry over: they're the
+        // conditions the winner hasn't been heard in yet.
+        let mut moved: Vec<(Vec<f32>, i64)> = load_exemplars(pool, &loser.id, &loser.embedding_model)
+            .await
+            .map_err(|e| format!("Failed to load exemplars: {}", e))?;
+        moved.push((loser_centroid, loser.sample_count.max(1)));
+        add_exemplars(pool, &winner.id, &winner.embedding_model, moved)
+            .await
+            .map_err(|e| format!("Failed to update exemplars: {}", e))?;
         true
     } else {
         log::warn!(
-            "Embedding-dim mismatch ({} vs {}) merging {} into {} — relinking transcripts only",
+            "Embedding mismatch ({} {}-dim vs {} {}-dim) merging {} into {} — relinking transcripts only",
+            winner.embedding_model,
             winner.embedding_dim,
+            loser.embedding_model,
             loser.embedding_dim,
             loser.id,
             winner.id,
@@ -599,15 +701,22 @@ pub async fn merge_cluster_into_profile<R: Runtime>(
         .map_err(|e| format!("Failed to load profile: {}", e))?
         .ok_or_else(|| format!("Profile not found: {}", args.profile_id))?;
 
-    // Pull this label's embeddings if the diarizer is still reachable.
-    let cluster_embeddings = current_diarizer()
-        .map(|d| d.embeddings_for_label(&old_label))
+    // Pull this label's embeddings if the diarizer is still reachable — and
+    // only if they come from the same model as the profile.
+    let diarizer = current_diarizer();
+    let same_model = diarizer
+        .as_ref()
+        .map_or(false, |d| d.embedding_model() == profile.embedding_model);
+    let cluster_embeddings = diarizer
+        .as_ref()
+        .filter(|_| same_model)
+        .map(|d| d.weighted_embeddings_for_label(&old_label))
         .unwrap_or_default();
 
     let centroid_updated = if !cluster_embeddings.is_empty()
-        && cluster_embeddings[0].len() as i64 == profile.embedding_dim
+        && cluster_embeddings[0].0.len() as i64 == profile.embedding_dim
     {
-        let cluster_centroid = average_and_normalize(&cluster_embeddings);
+        let cluster_centroid = weighted_centroid(&cluster_embeddings);
         let profile_centroid = bytes_to_floats(&profile.embedding)
             .ok_or_else(|| "Profile has corrupt embedding".to_string())?;
         let merged = merge_centroids(
@@ -620,13 +729,27 @@ pub async fn merge_cluster_into_profile<R: Runtime>(
         VoiceProfilesRepository::update_centroid(pool, &profile.id, &merged, new_count)
             .await
             .map_err(|e| format!("Failed to update profile centroid: {}", e))?;
+        add_exemplars(
+            pool,
+            &profile.id,
+            &profile.embedding_model,
+            vec![(cluster_centroid, cluster_embeddings.len() as i64)],
+        )
+        .await
+        .map_err(|e| format!("Failed to update exemplars: {}", e))?;
         true
     } else {
-        if !cluster_embeddings.is_empty() {
+        if diarizer.is_some() && !same_model {
+            log::warn!(
+                "Profile {} was built with {}, the session with another model — skipping centroid update",
+                profile.id,
+                profile.embedding_model,
+            );
+        } else if !cluster_embeddings.is_empty() {
             log::warn!(
                 "Embedding-dim mismatch for {} ({} vs profile {}) — skipping centroid update",
                 old_label,
-                cluster_embeddings[0].len(),
+                cluster_embeddings[0].0.len(),
                 profile.embedding_dim,
             );
         } else {
@@ -675,6 +798,11 @@ pub async fn merge_cluster_into_profile<R: Runtime>(
 /// Re-cluster the just-finished recording offline and write the improved
 /// speaker labels into `meeting_id`'s saved transcripts.
 ///
+/// With `audio_path` (the saved recording) and the segmentation model on
+/// disk, the recording gets a full offline diarization pass and the session
+/// is regrouped by its speaker turns; otherwise — or if that pass fails —
+/// the live embeddings are re-clustered with HAC.
+///
 /// Called right after the meeting is saved (see
 /// `audio::recording_commands::trigger_post_meeting_refine`). Emits
 /// `speakers-refined` (`{ meeting_id, changed_count }`) on success so the
@@ -693,7 +821,11 @@ pub async fn merge_cluster_into_profile<R: Runtime>(
 /// the history, and only the next `try_init_for_recording` replaces it. If
 /// the slot is empty anyway (speaker model never downloaded, so no diarizer
 /// was ever built) we log and skip.
-pub async fn refine_and_persist<R: Runtime>(app: &AppHandle<R>, meeting_id: &str) -> Result<usize> {
+pub async fn refine_and_persist<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    audio_path: Option<PathBuf>,
+) -> Result<usize> {
     let Some(diarizer) = current_diarizer() else {
         log::info!(
             "No diarizer available for meeting {} — skipping speaker refinement",
@@ -707,7 +839,12 @@ pub async fn refine_and_persist<R: Runtime>(app: &AppHandle<R>, meeting_id: &str
     // as whisper/embedding inference elsewhere).
     let refined = {
         let diarizer = diarizer.clone();
-        tokio::task::spawn_blocking(move || diarizer.refine())
+        tokio::task::spawn_blocking(move || {
+            let turns = audio_path
+                .as_deref()
+                .and_then(offline::diarize_file_if_available);
+            diarizer.refine_with_turns(turns.as_deref())
+        })
             .await
             .map_err(|e| anyhow!("Speaker refinement task panicked: {}", e))?
     };
@@ -774,3 +911,34 @@ pub async fn refine_and_persist<R: Runtime>(app: &AppHandle<R>, meeting_id: &str
     Ok(changed_count as usize)
 }
 
+
+fn weighted_centroid(embeddings: &[(Vec<f32>, f32)]) -> Vec<f32> {
+    let (vectors, weights): (Vec<Vec<f32>>, Vec<f32>) = embeddings.iter().cloned().unzip();
+    weighted_average_and_normalize(&vectors, &weights)
+}
+
+async fn load_exemplars(
+    pool: &SqlitePool,
+    profile_id: &str,
+    embedding_model: &str,
+) -> Result<Vec<(Vec<f32>, i64)>, sqlx::Error> {
+    Ok(VoiceProfilesRepository::list_exemplars(pool, profile_id)
+        .await?
+        .into_iter()
+        .filter(|e| e.embedding_model == embedding_model)
+        .filter_map(|e| bytes_to_floats(&e.embedding).map(|v| (v, e.sample_count)))
+        .collect())
+}
+
+/// Add `new` exemplars to a profile, pruning to [`MAX_EXEMPLARS`].
+async fn add_exemplars(
+    pool: &SqlitePool,
+    profile_id: &str,
+    embedding_model: &str,
+    new: Vec<(Vec<f32>, i64)>,
+) -> Result<(), sqlx::Error> {
+    let mut exemplars = load_exemplars(pool, profile_id, embedding_model).await?;
+    exemplars.extend(new);
+    prune_exemplars(&mut exemplars, MAX_EXEMPLARS);
+    VoiceProfilesRepository::replace_exemplars(pool, profile_id, embedding_model, &exemplars).await
+}

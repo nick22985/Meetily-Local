@@ -1,17 +1,24 @@
 //! Match a live embedding against stored voice profiles.
 //!
-//! Wraps `sherpa_onnx::SpeakerEmbeddingManager`. The manager keeps an
-//! in-memory index keyed by **profile id** (not name), so renames don't
-//! invalidate the index. We map the matched id back to the profile id used
-//! by the rest of the app via the populated `id_to_name` table.
+//! Each profile is a centroid plus a few **exemplars** — embeddings captured
+//! at separate naming / merge / enrollment events. A centroid averages a voice
+//! across every mic and room it was heard in, which blurs it; an exemplar
+//! keeps one of those conditions sharp. An embedding's score against a profile
+//! is the better of its centroid similarity and its best exemplar similarity
+//! minus [`EXEMPLAR_MARGIN`] (a single exemplar is a noisier estimate than the
+//! centroid, so it has to clear the bar by a bit more).
 //!
-//! Loaded once per session (live recording or batch job) with all profiles
-//! whose embedding dim matches the active model. Profiles with mismatched
-//! dims are skipped (logged) so a model upgrade doesn't crash the matcher.
+//! Loaded once per session (live recording or batch job) with the profiles
+//! built by the active embedding model. Entries whose dimension doesn't match
+//! the model are skipped (logged) so a stale row can't crash the matcher.
 
-use anyhow::Result;
-use sherpa_onnx::SpeakerEmbeddingManager;
-use std::collections::HashMap;
+use crate::speaker_diarization::embedding_math::{dot, l2_normalize};
+
+/// Penalty applied to exemplar similarity before comparing to the threshold.
+pub const EXEMPLAR_MARGIN: f32 = 0.05;
+
+/// Most exemplars kept per profile; see [`prune_exemplars`].
+pub const MAX_EXEMPLARS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ProfileMatch {
@@ -20,63 +27,62 @@ pub struct ProfileMatch {
     pub score: f32,
 }
 
+/// One stored profile as loaded from the DB.
+#[derive(Debug, Clone)]
+pub struct StoredProfile {
+    pub id: String,
+    pub name: String,
+    pub centroid: Vec<f32>,
+    pub exemplars: Vec<Vec<f32>>,
+}
+
 pub struct SpeakerProfileMatcher {
-    manager: SpeakerEmbeddingManager,
-    /// Maps the profile id stored in the underlying manager back to the
-    /// (profile_id, display_name) pair we expose to callers.
-    profiles: HashMap<String, String>, // id -> name
+    profiles: Vec<StoredProfile>,
     threshold: f32,
 }
 
 impl SpeakerProfileMatcher {
-    /// Build a matcher that searches for embeddings of the given dimension.
-    /// `profiles`: iterable of `(id, name, embedding)` from the DB. Embeddings
-    /// with mismatched dim are skipped.
-    pub fn new<I>(dim: usize, profiles: I, threshold: f32) -> Result<Self>
+    /// Build a matcher for embeddings of dimension `dim`. Centroids and
+    /// exemplars are L2-normalized here; mismatched-dim entries are dropped.
+    pub fn new<I>(dim: usize, profiles: I, threshold: f32) -> Self
     where
-        I: IntoIterator<Item = (String, String, Vec<f32>)>,
+        I: IntoIterator<Item = StoredProfile>,
     {
-        let manager = SpeakerEmbeddingManager::create(dim as i32)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create SpeakerEmbeddingManager"))?;
-
-        let mut id_to_name = HashMap::new();
-        let mut loaded = 0usize;
+        let mut loaded = Vec::new();
         let mut skipped = 0usize;
-        for (id, name, embedding) in profiles {
-            if embedding.len() != dim {
+        let mut exemplar_count = 0usize;
+        for mut p in profiles {
+            if p.centroid.len() != dim {
                 log::warn!(
                     "Skipping voice profile '{}' (id={}): embedding dim {} != active model dim {}",
-                    name,
-                    id,
-                    embedding.len(),
+                    p.name,
+                    p.id,
+                    p.centroid.len(),
                     dim
                 );
                 skipped += 1;
                 continue;
             }
-            // Use the profile id (not the name) as the key in the manager so
-            // duplicate display names don't collide and renames don't require
-            // a rebuild.
-            if manager.add(&id, &embedding) {
-                id_to_name.insert(id, name);
-                loaded += 1;
-            } else {
-                log::warn!("SpeakerEmbeddingManager::add failed for '{}'", name);
+            l2_normalize(&mut p.centroid);
+            p.exemplars.retain(|e| e.len() == dim);
+            for e in p.exemplars.iter_mut() {
+                l2_normalize(e);
             }
+            exemplar_count += p.exemplars.len();
+            loaded.push(p);
         }
         log::info!(
-            "Profile matcher loaded {} profiles ({} skipped, dim={}, threshold={})",
-            loaded,
+            "Profile matcher loaded {} profiles with {} exemplars ({} skipped, dim={}, threshold={})",
+            loaded.len(),
+            exemplar_count,
             skipped,
             dim,
             threshold
         );
-
-        Ok(Self {
-            manager,
-            profiles: id_to_name,
+        Self {
+            profiles: loaded,
             threshold,
-        })
+        }
     }
 
     pub fn num_profiles(&self) -> usize {
@@ -84,23 +90,147 @@ impl SpeakerProfileMatcher {
     }
 
     /// Find the best matching stored profile for `embedding`, or `None` if no
-    /// profile is above threshold.
+    /// profile scores at or above threshold.
     pub fn search(&self, embedding: &[f32]) -> Option<ProfileMatch> {
-        // `get_best_matches` returns up to `n` matches above threshold; we
-        // only care about the top one. Score is cosine sim in [-1, 1].
-        let mut matches = self
-            .manager
-            .get_best_matches(embedding, self.threshold, 1);
-        let m = matches.pop()?;
-        let name = self.profiles.get(&m.name).cloned()?;
-        Some(ProfileMatch {
-            profile_id: m.name, // sherpa stores our profile_id under "name"
-            name,
-            score: m.score,
-        })
+        let mut query = embedding.to_vec();
+        l2_normalize(&mut query);
+        self.profiles
+            .iter()
+            .filter(|p| p.centroid.len() == query.len())
+            .map(|p| (p, profile_score(p, &query)))
+            .filter(|(_, score)| *score >= self.threshold)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, score)| ProfileMatch {
+                profile_id: p.id.clone(),
+                name: p.name.clone(),
+                score,
+            })
     }
 }
 
-// `SpeakerEmbeddingManager` is `Send + Sync` per its sherpa-onnx unsafe impl.
-// We rely on that here so the matcher can live behind an `Arc` shared by the
-// transcription worker and the diarizer.
+fn profile_score(profile: &StoredProfile, query: &[f32]) -> f32 {
+    let centroid = dot(&profile.centroid, query);
+    let exemplar = profile
+        .exemplars
+        .iter()
+        .map(|e| dot(e, query) - EXEMPLAR_MARGIN)
+        .fold(f32::NEG_INFINITY, f32::max);
+    centroid.max(exemplar)
+}
+
+/// Trim `exemplars` (`(embedding, sample_count)`) to at most `cap` by
+/// repeatedly dropping the most redundant one — the exemplar most similar to
+/// some other exemplar. That keeps the set spread across the conditions it
+/// was captured in instead of keeping the newest or oldest.
+pub fn prune_exemplars(exemplars: &mut Vec<(Vec<f32>, i64)>, cap: usize) {
+    while exemplars.len() > cap.max(1) {
+        let normed: Vec<Vec<f32>> = exemplars
+            .iter()
+            .map(|(e, _)| {
+                let mut v = e.clone();
+                l2_normalize(&mut v);
+                v
+            })
+            .collect();
+        let redundancy = |i: usize| {
+            (0..normed.len())
+                .filter(|&j| j != i && normed[j].len() == normed[i].len())
+                .map(|j| dot(&normed[i], &normed[j]))
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let victim = (0..normed.len())
+            .max_by(|&a, &b| redundancy(a).total_cmp(&redundancy(b)))
+            .expect("exemplars is non-empty");
+        exemplars.remove(victim);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(id: &str, centroid: Vec<f32>, exemplars: Vec<Vec<f32>>) -> StoredProfile {
+        StoredProfile {
+            id: id.to_string(),
+            name: id.to_uppercase(),
+            centroid,
+            exemplars,
+        }
+    }
+
+    #[test]
+    fn centroid_match_above_threshold() {
+        let m = SpeakerProfileMatcher::new(2, vec![profile("a", vec![1.0, 0.0], vec![])], 0.6);
+        let hit = m.search(&[0.9, 0.1]).unwrap();
+        assert_eq!(hit.profile_id, "a");
+        assert_eq!(hit.name, "A");
+        assert!(m.search(&[0.0, 1.0]).is_none());
+    }
+
+    /// An embedding far from the centroid but close to one exemplar (the
+    /// voice under other conditions) still matches.
+    #[test]
+    fn exemplar_rescues_a_condition_the_centroid_blurs() {
+        let p = profile("a", vec![1.0, 0.0, 0.0], vec![vec![0.0, 1.0, 0.0]]);
+        let m = SpeakerProfileMatcher::new(3, vec![p], 0.6);
+        let hit = m.search(&[0.1, 0.99, 0.0]).unwrap();
+        assert_eq!(hit.profile_id, "a");
+        assert!(hit.score < 0.99);
+    }
+
+    #[test]
+    fn exemplar_margin_applies() {
+        // Exemplar similarity exactly at threshold fails once the margin is
+        // subtracted.
+        let p = profile("a", vec![0.0, 1.0], vec![vec![1.0, 0.0]]);
+        let m = SpeakerProfileMatcher::new(2, vec![p], 0.6);
+        let q = [0.6f32, 0.8];
+        assert!(m.search(&q).is_some()); // centroid sim 0.8
+        let p = profile("b", vec![0.0, 1.0], vec![vec![1.0, 0.0]]);
+        let m = SpeakerProfileMatcher::new(2, vec![p], 0.85);
+        assert!(m.search(&[0.88, 0.47]).is_none()); // exemplar 0.88-0.05 < 0.85
+    }
+
+    #[test]
+    fn best_profile_wins() {
+        let m = SpeakerProfileMatcher::new(
+            2,
+            vec![
+                profile("a", vec![1.0, 0.0], vec![]),
+                profile("b", vec![0.8, 0.6], vec![]),
+            ],
+            0.5,
+        );
+        assert_eq!(m.search(&[0.7, 0.7]).unwrap().profile_id, "b");
+    }
+
+    #[test]
+    fn wrong_dim_profiles_are_skipped() {
+        let m = SpeakerProfileMatcher::new(
+            2,
+            vec![profile("a", vec![1.0, 0.0, 0.0], vec![]), profile("b", vec![1.0, 0.0], vec![])],
+            0.5,
+        );
+        assert_eq!(m.num_profiles(), 1);
+    }
+
+    #[test]
+    fn pruning_drops_the_most_redundant_exemplar() {
+        let mut ex = vec![
+            (vec![1.0, 0.0], 1),
+            (vec![0.0, 1.0], 1),
+            (vec![0.99, 0.01], 1),
+        ];
+        prune_exemplars(&mut ex, 2);
+        assert_eq!(ex.len(), 2);
+        // One of the two near-duplicates went; the distinct one stayed.
+        assert!(ex.iter().any(|(e, _)| e[1] == 1.0));
+    }
+
+    #[test]
+    fn pruning_under_cap_is_a_no_op() {
+        let mut ex = vec![(vec![1.0, 0.0], 1)];
+        prune_exemplars(&mut ex, MAX_EXEMPLARS);
+        assert_eq!(ex.len(), 1);
+    }
+}

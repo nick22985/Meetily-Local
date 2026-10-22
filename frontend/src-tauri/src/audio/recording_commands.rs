@@ -1018,9 +1018,9 @@ pub async fn get_recording_meeting_name() -> Result<Option<String>, String> {
 ///
 /// Two passes run here, in a deliberate order inside one background task:
 ///
-/// 1. **Speaker refinement** — re-clusters the live session's embeddings
-///    offline and rewrites `speaker` labels in place (fast: in-memory
-///    clustering plus a handful of UPDATEs).
+/// 1. **Speaker refinement** — runs offline diarization over the saved
+///    recording (falling back to re-clustering the live session's
+///    embeddings) and rewrites `speaker` labels in place.
 /// 2. **Transcription auto-refine** — optionally re-transcribes the whole
 ///    meeting with a higher-accuracy model.
 ///
@@ -1047,8 +1047,16 @@ pub async fn trigger_post_meeting_refine<R: Runtime>(
     tauri::async_runtime::spawn(async move {
         // Never let a speaker-refinement failure block the transcription
         // pass — they're independent improvements to the same meeting.
-        if let Err(e) =
-            crate::speaker_diarization::commands::refine_and_persist(&app, &meeting_id).await
+        let audio_path =
+            super::retranscription::find_audio_file(std::path::Path::new(&meeting_folder_path))
+                .map_err(|e| log::info!("No saved audio for offline diarization: {}", e))
+                .ok();
+        if let Err(e) = crate::speaker_diarization::commands::refine_and_persist(
+            &app,
+            &meeting_id,
+            audio_path,
+        )
+        .await
         {
             log::warn!(
                 "Speaker refinement failed for meeting {}: {} (transcript labels left as recorded)",

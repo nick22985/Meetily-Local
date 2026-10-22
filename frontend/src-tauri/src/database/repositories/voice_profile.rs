@@ -5,19 +5,24 @@
 //! stored alongside so a model change can be detected at load time before
 //! we feed a wrong-shaped vector to the matcher.
 //!
+//! Each profile also records the embedding model that produced it, and may
+//! carry a few extra exemplar embeddings (`voice_profile_exemplars`) that
+//! capture the voice under different conditions than the centroid averages
+//! over.
+//!
 //! One profile may carry `is_self = 1`: the local user's enrolled voice (see
 //! `speaker_diarization::enrollment`). It's an ordinary profile in every
 //! other respect — the matcher loads it alongside the rest, so the user's own
 //! voice gets recognized in meetings like any known speaker.
 
-use crate::database::models::VoiceProfile;
+use crate::database::models::{VoiceProfile, VoiceProfileExemplar};
 use chrono::Utc;
 use sqlx::{Error as SqlxError, SqlitePool};
 use uuid::Uuid;
 
 /// Columns of `voice_profiles` in the order [`VoiceProfile`] declares them.
-const PROFILE_COLUMNS: &str =
-    "id, name, email, embedding, embedding_dim, sample_count, is_self, created_at, updated_at";
+const PROFILE_COLUMNS: &str = "id, name, email, embedding, embedding_dim, sample_count, \
+     embedding_model, is_self, created_at, updated_at";
 
 pub struct VoiceProfilesRepository;
 
@@ -79,11 +84,15 @@ impl VoiceProfilesRepository {
     /// `sample_count` is the number of embedding windows that went into
     /// `embedding` (the centroid), not a delta: enrollment always rebuilds the
     /// centroid from scratch out of the fresh recording.
+    ///
+    /// The profile's exemplars are replaced by the new centroid: enrollment
+    /// is a deliberate reset of what "my voice" sounds like.
     pub async fn upsert_self(
         pool: &SqlitePool,
         name: &str,
         embedding: &[f32],
         sample_count: i64,
+        embedding_model: &str,
     ) -> Result<String, SqlxError> {
         let now = Utc::now().to_rfc3339();
         let bytes = floats_to_bytes(embedding);
@@ -105,13 +114,14 @@ impl VoiceProfilesRepository {
                 sqlx::query(
                     "UPDATE voice_profiles
                      SET name = ?, embedding = ?, embedding_dim = ?, sample_count = ?,
-                         is_self = 1, updated_at = ?
+                         embedding_model = ?, is_self = 1, updated_at = ?
                      WHERE id = ?",
                 )
                 .bind(name)
                 .bind(&bytes)
                 .bind(embedding.len() as i64)
                 .bind(sample_count)
+                .bind(embedding_model)
                 .bind(&now)
                 .bind(&id)
                 .execute(&mut *tx)
@@ -122,15 +132,16 @@ impl VoiceProfilesRepository {
                 let id = format!("profile-{}", Uuid::new_v4());
                 sqlx::query(
                     "INSERT INTO voice_profiles
-                     (id, name, email, embedding, embedding_dim, sample_count, is_self,
-                      created_at, updated_at)
-                     VALUES (?, ?, NULL, ?, ?, ?, 1, ?, ?)",
+                     (id, name, email, embedding, embedding_dim, sample_count,
+                      embedding_model, is_self, created_at, updated_at)
+                     VALUES (?, ?, NULL, ?, ?, ?, ?, 1, ?, ?)",
                 )
                 .bind(&id)
                 .bind(name)
                 .bind(&bytes)
                 .bind(embedding.len() as i64)
                 .bind(sample_count)
+                .bind(embedding_model)
                 .bind(&now)
                 .bind(&now)
                 .execute(&mut *tx)
@@ -138,6 +149,12 @@ impl VoiceProfilesRepository {
                 id
             }
         };
+
+        sqlx::query("DELETE FROM voice_profile_exemplars WHERE profile_id = ?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        insert_exemplar(&mut tx, &id, embedding, sample_count, embedding_model, &now).await?;
 
         tx.commit().await?;
         Ok(id)
@@ -156,16 +173,18 @@ impl VoiceProfilesRepository {
         email: Option<&str>,
         embedding: &[f32],
         sample_count: i64,
+        embedding_model: &str,
     ) -> Result<String, SqlxError> {
         let id = format!("profile-{}", Uuid::new_v4());
         let now = Utc::now().to_rfc3339();
         let bytes = floats_to_bytes(embedding);
+        let mut tx = pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO voice_profiles
-             (id, name, email, embedding, embedding_dim, sample_count, is_self,
-              created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+             (id, name, email, embedding, embedding_dim, sample_count, embedding_model,
+              is_self, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&id)
         .bind(name)
@@ -173,11 +192,16 @@ impl VoiceProfilesRepository {
         .bind(&bytes)
         .bind(embedding.len() as i64)
         .bind(sample_count)
+        .bind(embedding_model)
         .bind(&now)
         .bind(&now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        // The founding centroid doubles as the first exemplar, so it stays
+        // matchable after later merges move the centroid.
+        insert_exemplar(&mut tx, &id, embedding, sample_count, embedding_model, &now).await?;
 
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -204,6 +228,10 @@ impl VoiceProfilesRepository {
     }
 
     pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, SqlxError> {
+        sqlx::query("DELETE FROM voice_profile_exemplars WHERE profile_id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
         let res = sqlx::query("DELETE FROM voice_profiles WHERE id = ?")
             .bind(id)
             .execute(pool)
@@ -243,6 +271,81 @@ impl VoiceProfilesRepository {
         .await?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// Every exemplar recorded with `embedding_model`, across all profiles.
+    pub async fn list_exemplars_for_model(
+        pool: &SqlitePool,
+        embedding_model: &str,
+    ) -> Result<Vec<VoiceProfileExemplar>, SqlxError> {
+        sqlx::query_as::<_, VoiceProfileExemplar>(&format!(
+            "SELECT {EXEMPLAR_COLUMNS} FROM voice_profile_exemplars
+             WHERE embedding_model = ? ORDER BY created_at"
+        ))
+        .bind(embedding_model)
+        .fetch_all(pool)
+        .await
+    }
+
+    pub async fn list_exemplars(
+        pool: &SqlitePool,
+        profile_id: &str,
+    ) -> Result<Vec<VoiceProfileExemplar>, SqlxError> {
+        sqlx::query_as::<_, VoiceProfileExemplar>(&format!(
+            "SELECT {EXEMPLAR_COLUMNS} FROM voice_profile_exemplars
+             WHERE profile_id = ? ORDER BY created_at"
+        ))
+        .bind(profile_id)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Replace all of a profile's exemplars with `exemplars`
+    /// (`(embedding, sample_count)` pairs) in one transaction.
+    pub async fn replace_exemplars(
+        pool: &SqlitePool,
+        profile_id: &str,
+        embedding_model: &str,
+        exemplars: &[(Vec<f32>, i64)],
+    ) -> Result<(), SqlxError> {
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM voice_profile_exemplars WHERE profile_id = ?")
+            .bind(profile_id)
+            .execute(&mut *tx)
+            .await?;
+        for (embedding, count) in exemplars {
+            insert_exemplar(&mut tx, profile_id, embedding, *count, embedding_model, &now).await?;
+        }
+        tx.commit().await
+    }
+}
+
+const EXEMPLAR_COLUMNS: &str =
+    "id, profile_id, embedding, embedding_dim, embedding_model, sample_count, created_at";
+
+async fn insert_exemplar(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    profile_id: &str,
+    embedding: &[f32],
+    sample_count: i64,
+    embedding_model: &str,
+    now: &str,
+) -> Result<(), SqlxError> {
+    sqlx::query(
+        "INSERT INTO voice_profile_exemplars
+         (id, profile_id, embedding, embedding_dim, embedding_model, sample_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(format!("exemplar-{}", Uuid::new_v4()))
+    .bind(profile_id)
+    .bind(floats_to_bytes(embedding))
+    .bind(embedding.len() as i64)
+    .bind(embedding_model)
+    .bind(sample_count)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Pack `f32` slice as little-endian bytes for BLOB storage. Total bytes = 4 * len.

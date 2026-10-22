@@ -28,6 +28,7 @@ import {
   VoiceProfile,
 } from "@/lib/voice-profiles";
 import { SelfVoiceEnrollment } from "./SelfVoiceEnrollment";
+import { SpeakerRecognitionSettings } from "./SpeakerRecognitionSettings";
 import { Heading, Text } from "@/components/ui/typography";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import type { SelfVoiceStatus } from "@/lib/self-voice";
@@ -54,6 +55,7 @@ export function SpeakerSettings() {
   const [selfProfileId, setSelfProfileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<EditingState>({ kind: "idle" });
+  const [activeModel, setActiveModel] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -142,7 +144,17 @@ export function SpeakerSettings() {
             <tbody>
               {profiles.map((p) => (
                 <tr key={p.id} className="border-t border-border">
-                  <td className="px-4 py-2 font-medium">{p.name}</td>
+                  <td className="px-4 py-2 font-medium">
+                    {p.name}
+                    {activeModel && p.embedding_model !== activeModel && (
+                      <span
+                        className="ml-2 text-xs font-normal text-muted-foreground"
+                        title="Made with a different voice model. Re-name this speaker on a new transcript to recognise them again."
+                      >
+                        other model
+                      </span>
+                    )}
+                  </td>
                   <td className="px-4 py-2 text-muted-foreground">
                     {p.email ?? (
                       <span className="text-muted-foreground/60">—</span>
@@ -191,6 +203,8 @@ export function SpeakerSettings() {
           </table>
         </div>
       )}
+
+      <SpeakerRecognitionSettings onActiveModelChange={setActiveModel} />
 
       {editing.kind === "edit" && (
         <EditDialog

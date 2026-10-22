@@ -2,7 +2,7 @@
 # Meetily — dev launcher (Linux focus)
 #
 # Usage:
-#   ./dev.sh              # auto: full Tauri dev with CUDA on NVIDIA, CPU otherwise
+#   ./dev.sh              # auto: CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise
 #   ./dev.sh cuda         # full Tauri dev, NVIDIA CUDA
 #   ./dev.sh vulkan       # full Tauri dev, AMD/Intel Vulkan
 #   ./dev.sh cpu          # full Tauri dev, CPU-only
@@ -37,6 +37,8 @@ case "$MODE" in
     auto)
         if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
             MODE=cuda
+        elif grep -qsx -e 0x1002 -e 0x8086 /sys/class/drm/card*/device/vendor; then
+            MODE=vulkan
         else
             MODE=cpu
         fi

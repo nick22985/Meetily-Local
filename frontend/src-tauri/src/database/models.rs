@@ -56,6 +56,9 @@ pub struct VoiceProfile {
     pub embedding: Vec<u8>,
     pub embedding_dim: i64,
     pub sample_count: i64,
+    /// Filename of the speaker-embedding model that produced `embedding`.
+    /// Only profiles for the active model are loaded into the matcher.
+    pub embedding_model: String,
     /// True for the single profile holding the local user's own enrolled
     /// voice. At most one row has this set (enforced by a partial unique
     /// index); it is what makes the user's mic speech render as "Me" instead
@@ -63,6 +66,20 @@ pub struct VoiceProfile {
     pub is_self: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// An extra embedding stored for a voice profile alongside its centroid (see
+/// `voice_profile_exemplars`).
+#[derive(Debug, Clone, FromRow)]
+pub struct VoiceProfileExemplar {
+    pub id: String,
+    pub profile_id: String,
+    /// Packed little-endian f32.
+    pub embedding: Vec<u8>,
+    pub embedding_dim: i64,
+    pub embedding_model: String,
+    pub sample_count: i64,
+    pub created_at: String,
 }
 
 /// A single tracked action item belonging to a meeting.
