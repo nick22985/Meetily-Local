@@ -75,7 +75,7 @@ Clone, then run the all-in-one build script:
 ```bash
 git clone https://github.com/Hankanman/Parley.git
 cd Parley
-./build.sh           # auto: CUDA on Linux with NVIDIA, CPU otherwise
+./build.sh           # auto: CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise
 ./build.sh cuda      # NVIDIA explicit
 ./build.sh vulkan    # AMD/Intel
 ./build.sh cpu       # CPU only

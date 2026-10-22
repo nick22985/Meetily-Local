@@ -2,7 +2,7 @@
 # Parley (parley-gpui) — all-in-one build script (Linux focus)
 #
 # Usage:
-#   ./build.sh              # default: cuda on Linux with NVIDIA, cpu otherwise
+#   ./build.sh              # default: cuda with NVIDIA, vulkan with AMD/Intel, cpu otherwise
 #   ./build.sh cuda         # NVIDIA CUDA
 #   ./build.sh vulkan       # AMD/Intel Vulkan
 #   ./build.sh cpu          # CPU-only
@@ -96,6 +96,8 @@ setup_sccache() {
 resolve_auto_mode() {
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
         echo cuda
+    elif grep -qsx -e 0x1002 -e 0x8086 /sys/class/drm/card*/device/vendor; then
+        echo vulkan  # AMD (0x1002) or Intel (0x8086) GPU
     else
         echo cpu
     fi

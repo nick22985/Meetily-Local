@@ -2,7 +2,7 @@
 # Parley (parley-gpui) — dev launcher (Linux focus)
 #
 # Usage:
-#   ./dev.sh              # auto: CUDA on NVIDIA, CPU otherwise
+#   ./dev.sh              # auto: CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise
 #   ./dev.sh cuda         # NVIDIA CUDA
 #   ./dev.sh vulkan       # AMD/Intel Vulkan
 #   ./dev.sh cpu          # CPU-only
@@ -91,10 +91,13 @@ setup_dev_cuda_env() {
     esac
 }
 
-# Resolves "auto" to cuda/cpu based on nvidia-smi presence.
+# Resolves "auto": cuda with a working nvidia-smi, vulkan with an AMD/Intel
+# GPU in /sys/class/drm, cpu otherwise.
 resolve_auto_mode() {
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
         echo cuda
+    elif grep -qsx -e 0x1002 -e 0x8086 /sys/class/drm/card*/device/vendor; then
+        echo vulkan  # AMD (0x1002) or Intel (0x8086) GPU
     else
         echo cpu
     fi

@@ -9,7 +9,7 @@ for background.
 ```bash
 git clone https://github.com/Hankanman/Parley.git
 cd Parley
-./build.sh           # production build → Parley-<version>-x86_64.AppImage (auto: CUDA on NVIDIA, CPU otherwise)
+./build.sh           # production build → Parley-<version>-x86_64.AppImage (auto: CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise)
 ./dev.sh              # development mode, cargo run -p parley-gpui
 ./clean.sh             # nuke target/
 ```

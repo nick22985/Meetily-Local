@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Root-level scripts (recommended — handle CUDA/Vulkan env setup and the `llama-helper` sidecar build for you):
 
 ```bash
-./dev.sh                    # auto: CUDA on NVIDIA, CPU otherwise — cargo run -p parley-gpui
+./dev.sh                    # auto: CUDA on NVIDIA, Vulkan on AMD/Intel, CPU otherwise — cargo run -p parley-gpui
 ./dev.sh cuda                # NVIDIA CUDA
 ./dev.sh vulkan               # AMD/Intel Vulkan
 ./dev.sh cpu                  # CPU-only
