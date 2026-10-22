@@ -154,6 +154,9 @@ const COMMAND_DEFAULTS: Record<string, Default> = {
   // Guarded by `if (settings)`, then read nested as
   // `.notification_preferences.show_recording_started` — null skips it safely.
   get_notification_settings: null,
+  // Read as `?.hide_on_close` in PreferenceSettings.
+  api_get_window_behavior_settings: null,
+  api_set_window_behavior_settings: null,
   get_ollama_models: () => [], // .map()
   whisper_get_available_models: () => [], // .some()
   builtin_ai_list_models: () => [],

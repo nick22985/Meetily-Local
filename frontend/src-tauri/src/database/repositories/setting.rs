@@ -21,6 +21,8 @@ pub const KEY_NOTIFICATION_SETTINGS: &str = "notification_settings";
 pub const KEY_UI_CONFIG: &str = "ui_config";
 /// Automatic meeting detection settings (see `meeting_detector::settings::MeetingDetectionSettings`).
 pub const KEY_MEETING_DETECTION: &str = "meeting_detection_settings";
+/// Main window close behavior (see `window_behavior::WindowBehaviorSettings`).
+pub const KEY_WINDOW_BEHAVIOR: &str = "window_behavior_settings";
 
 #[derive(serde::Deserialize, Debug)]
 pub struct SaveModelConfigRequest {

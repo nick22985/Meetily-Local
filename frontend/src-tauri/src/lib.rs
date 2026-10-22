@@ -38,6 +38,7 @@ pub mod summary;
 pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
+pub mod window_behavior;
 
 use audio::{list_audio_devices, trigger_audio_permission};
 use log::{error as log_error, info as log_info};
@@ -537,12 +538,20 @@ pub fn run() {
             tokio::sync::Mutex::new(None),
         )))
         .manage(meeting_detector::MeetingDetector::new())
+        .on_window_event(window_behavior::on_window_event)
         .setup(|_app| {
             log::info!("Application setup complete");
 
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
+            }
+
+            // The window starts hidden so --hide can keep it in the tray (e.g. when launched at login)
+            if !std::env::args().any(|arg| arg == "--hide") {
+                if let Some(window) = _app.get_webview_window("main") {
+                    let _ = window.show();
+                }
             }
 
             // Notification system is initialized *after* the database below —
@@ -684,6 +693,13 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let detector = app_for_detector.state::<meeting_detector::MeetingDetector>();
                 detector.initialize(&app_for_detector).await;
+            });
+
+            // Restore the close-to-tray preference. Reads `app_settings`,
+            // so it also has to wait for the database init above.
+            let app_for_window = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                window_behavior::initialize(&app_for_window).await;
             });
 
             // Initialize bundled templates directory for dynamic template discovery
@@ -862,6 +878,8 @@ pub fn run() {
             meeting_detector::commands::api_get_meeting_detection_status,
             meeting_detector::commands::api_list_meeting_apps,
             meeting_detector::commands::api_probe_capture_streams,
+            window_behavior::api_get_window_behavior_settings,
+            window_behavior::api_set_window_behavior_settings,
             // Database import commands
             database::commands::check_first_launch,
             database::commands::initialize_fresh_database,

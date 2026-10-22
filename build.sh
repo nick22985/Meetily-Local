@@ -2,7 +2,7 @@
 # Meetily — all-in-one build script (Linux focus)
 #
 # Usage:
-#   ./build.sh              # default: cuda on Linux with NVIDIA, cpu otherwise
+#   ./build.sh              # default: cuda with NVIDIA, vulkan with an AMD/Intel GPU, cpu otherwise
 #   ./build.sh cuda         # NVIDIA CUDA
 #   ./build.sh vulkan       # AMD/Intel Vulkan
 #   ./build.sh cpu          # CPU-only
@@ -36,6 +36,8 @@ case "$MODE" in
     auto)
         if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
             MODE=cuda
+        elif grep -qsx -e 0x1002 -e 0x8086 /sys/class/drm/card*/device/vendor; then
+            MODE=vulkan
         else
             MODE=cpu
         fi

@@ -21,6 +21,7 @@ export function PreferenceSettings() {
     boolean | null
   >(null);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [hideOnClose, setHideOnClose] = useState(false);
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] =
     useState<boolean | null>(null);
 
@@ -28,6 +29,30 @@ export function PreferenceSettings() {
   useEffect(() => {
     loadPreferences();
   }, [loadPreferences]);
+
+  useEffect(() => {
+    invoke<{ hide_on_close: boolean } | null>(
+      "api_get_window_behavior_settings",
+    )
+      .then((settings) =>
+        setHideOnClose(settings?.hide_on_close ?? false),
+      )
+      .catch((error) =>
+        console.error("Failed to load window behavior settings:", error),
+      );
+  }, []);
+
+  const handleHideOnCloseChange = async (enabled: boolean) => {
+    setHideOnClose(enabled);
+    try {
+      await invoke("api_set_window_behavior_settings", {
+        settings: { hide_on_close: enabled },
+      });
+    } catch (error) {
+      console.error("Failed to save window behavior settings:", error);
+      setHideOnClose(!enabled);
+    }
+  };
 
   // Update notificationsEnabled when notificationSettings are loaded from global state.
   // Mirrors async-loaded global preferences into local UI state — genuine sync cascade.
@@ -155,6 +180,29 @@ export function PreferenceSettings() {
           <Switch
             checked={notificationsEnabledValue}
             onCheckedChange={setNotificationsEnabled}
+          />
+        </div>
+      </div>
+
+      {/* Window Behavior Section */}
+      <div
+        className="
+        rounded-lg border border-border bg-card p-5 shadow-sm
+      "
+      >
+        <div className="flex items-center justify-between">
+          <div>
+            <Heading level={3} className="mb-2">
+              Close to Tray
+            </Heading>
+            <p className="text-sm text-muted-foreground">
+              Closing the window (e.g. Super+Q) hides it to the tray instead
+              of quitting. Reopen or quit from the tray menu.
+            </p>
+          </div>
+          <Switch
+            checked={hideOnClose}
+            onCheckedChange={handleHideOnCloseChange}
           />
         </div>
       </div>
